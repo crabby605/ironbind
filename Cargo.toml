@@ -1,0 +1,28 @@
+[package]
+name = "ironbind"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ironbind"
+path = "src/main.rs"
+
+# Zero external dependencies — pure std
+
+[dependencies]
+rsa = "0.9"
+sha2 = "0.10"
+sha1 = "0.10"
+p256 = { version = "0.13", features = ["pem", "ecdsa"] }
+p384 = { version = "0.13", features = ["pem", "ecdsa"] }
+ed25519-dalek = { version = "2.1", features = ["pem"] }
+pkcs1 = { version = "0.7", features = ["std", "pem"] }
+pkcs8 = { version = "0.10", features = ["std", "pem"] }
+spki = { version = "0.7", features = ["std"] }
+signature = "2.2"
+hex = "0.4"
+rand = "0.8"
+hmac = "0.12"
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
