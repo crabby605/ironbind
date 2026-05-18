@@ -117,78 +117,43 @@ impl ZoneTransfer {
         self.records.push((name.to_string(), rtype, rdata));
     }
 
-    /// Generate AXFR response (RFC 1035 §6.3 / RFC 5936)
-    /// Returns wire format responses (sequence of DNS packets)
+    /// Build AXFR response messages (RFC 5936). The real implementation lives
+    /// in `crate::axfr`; this is a thin builder kept for API-compat callers.
     pub fn to_wire_format(&self) -> Vec<Vec<u8>> {
-        let mut packets = Vec::new();
+        use crate::proto::{Packet, serialize};
+        let _ = Builder::new(); // keep Builder import live for the module
 
-        // AXFR session starts with SOA record
-        let soa_record = self.records.iter().find(|(_, rtype, _)| *rtype == 6 /* SOA */);
+        let soa_idx = self.records.iter().position(|(_, t, _)| *t == 6);
+        let Some(soa_idx) = soa_idx else {
+            eprintln!("[zone-transfer] no SOA — cannot build AXFR");
+            return Vec::new();
+        };
 
-        if let Some((soa_name, _, soa_rdata)) = soa_record {
-            // 1. Initial SOA packet
-            let mut b = Builder::new();
-            b.set_qr(true);
-            b.set_aa(true); // Authoritative
-            // Note: Header ID would be matched to query in real server
+        let make_record = |name: &str, rtype: u16, rdata: &[u8]| Record {
+            name: name.to_string(),
+            rtype: RType::from(rtype),
+            class: 1,
+            ttl: 3600,
+            rdata: rdata.to_vec(),
+        };
+        let soa = make_record(&self.records[soa_idx].0, 6, &self.records[soa_idx].2);
 
-            let soa_rec = Record {
-                name: soa_name.clone(),
-                rtype: RType::SOA,
-                class: 1, // IN
-                ttl: 3600, // Should be from zone
-                rdata: soa_rdata.clone(),
-            };
-            b.add_answer(&soa_rec);
-            packets.push(b.finish());
-
-            // 2. All records in zone (chunked in production, here simple 1-per-packet or batched)
-            // Simplified: putting all other records in subsequent packets
-            // In a real implementation we would pack up to 64KB for TCP
-
-            // For this implementation, we'll put up to 100 records per packet
-            let mut current_packet = Builder::new();
-            current_packet.set_qr(true);
-            current_packet.set_aa(true);
-            let mut count = 0;
-
-            for (rname, rtype, rrdata) in &self.records {
-                 // Convert u16 to RType
-                 let rt = RType::from(*rtype);
-
-                 let rec = Record {
-                    name: rname.clone(),
-                    rtype: rt,
-                    class: 1, // IN
-                    ttl: 3600,
-                    rdata: rrdata.clone(),
-                 };
-                 current_packet.add_answer(&rec);
-                 count += 1;
-
-                 if count >= 100 {
-                     packets.push(current_packet.finish());
-                     current_packet = Builder::new();
-                     current_packet.set_qr(true);
-                     current_packet.set_aa(true);
-                     count = 0;
-                 }
-            }
-            if count > 0 {
-                packets.push(current_packet.finish());
-            }
-
-            // 3. Final SOA packet (signals end of transfer)
-            let mut b = Builder::new();
-            b.set_qr(true);
-            b.set_aa(true);
-            b.add_answer(&soa_rec);
-            packets.push(b.finish());
-
-        } else {
-            eprintln!("[zone-transfer] Warning: No SOA record found for AXFR");
+        let mut all: Vec<Record> = Vec::with_capacity(self.records.len() + 2);
+        all.push(soa.clone());
+        for (i, (n, t, d)) in self.records.iter().enumerate() {
+            if i == soa_idx { continue; }
+            all.push(make_record(n, *t, d));
         }
+        all.push(soa);
 
+        const CHUNK: usize = 100;
+        let mut packets = Vec::new();
+        for slice in all.chunks(CHUNK) {
+            let mut pkt = Packet::new_response(0, 0);
+            pkt.set_aa();
+            pkt.answers = slice.to_vec();
+            packets.push(serialize(&pkt, false));
+        }
         packets
     }
 }

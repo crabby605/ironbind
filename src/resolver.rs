@@ -23,7 +23,7 @@ use std::{
     str::FromStr,
     time::Duration,
 };
-use crate::proto::{Packet, Parser, Question, RType, serialize, CLASS_IN};
+use crate::proto::{Packet, Parser, Question, Record, RType, serialize, CLASS_IN};
 
 // ── Root hints (IANA, as of 2024) ────────────────────────────────────────────
 

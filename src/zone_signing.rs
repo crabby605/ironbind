@@ -12,8 +12,8 @@ use crate::proto::{Record, RType, Builder};
 use rsa::{RsaPrivateKey, Pkcs1v15Sign};
 use rsa::traits::PublicKeyParts;
 use sha2::{Sha256, Sha512, Digest};
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use signature::RandomizedDigestSigner; // trait needed for sign_with_rng or just generic usage if any
 
 /// Zone signing key (ZSK) or Key signing key (KSK)
@@ -52,11 +52,11 @@ impl DnsKey {
 
         // Try PKCS#8
         let der = RsaPrivateKey::from_pkcs8_pem(&content)
-            .map(|k| k.to_pkcs8_der().unwrap().to_bytes().to_vec())
+            .map(|k| k.to_pkcs8_der().unwrap().as_bytes().to_vec())
             .or_else(|_| {
                 // Try PKCS#1
                 RsaPrivateKey::from_pkcs1_pem(&content)
-                    .map(|k| k.to_pkcs1_der().expect("der").to_vec())
+                    .map(|k| k.to_pkcs1_der().expect("der").as_bytes().to_vec())
             });
 
         let key_bytes = der.map_err(|e| std::io::Error::new(
