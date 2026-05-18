@@ -2,7 +2,7 @@
 
 [server]
 bind            = "0.0.0.0"
-port            = 53
+port            = 5000
 use_forwarders  = true        # try /etc/resolv.conf nameservers first
 dnssec_validate = true        # validate DNSSEC signatures
 log_level       = "info"
