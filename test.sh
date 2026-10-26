@@ -24,8 +24,6 @@ NC='\033[0m' # No Color
 TESTS_PASSED=0
 TESTS_FAILED=0
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 log() {
     echo -e "${BLUE}[INFO]${NC} $*"
 }
@@ -43,8 +41,6 @@ fail() {
 warn() {
     echo -e "${YELLOW}[WARN]${NC} $*"
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 setup_test_env() {
     log "Setting up test environment..."
@@ -131,8 +127,6 @@ EOF
     log "Test environment ready in $TEST_DIR"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 build_binary() {
     log "Building ironbind..."
 
@@ -147,8 +141,6 @@ build_binary() {
 
     success "Binary ready: $BINARY"
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 start_server() {
     log "Starting ironbind server on 127.0.0.1:$TEST_PORT..."
@@ -177,8 +169,6 @@ stop_server() {
         success "Server stopped"
     fi
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 query_dns() {
     local name="$1"
@@ -220,8 +210,6 @@ assert_nxdomain() {
         fail "$description (NXDOMAIN not found)"
     fi
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_basic_queries() {
     log "\n=== Test Suite 1: Basic Queries ==="
@@ -350,8 +338,6 @@ test_edns0() {
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 run_all_tests() {
     test_basic_queries
     test_record_types
@@ -381,8 +367,6 @@ print_summary() {
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 main() {
     trap stop_server EXIT
 
@@ -406,8 +390,6 @@ main() {
 
     exit $exit_code
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 if [ "$1" = "--help" ]; then
     cat << 'HELP'

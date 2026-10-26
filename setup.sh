@@ -23,7 +23,6 @@ ZONE="example.com"
 
 mkdir -p keys tls
 
-# ── 1. TSIG secret ────────────────────────────────────────────────────────────
 echo "→ Generating TSIG HMAC-SHA256 secret"
 TSIG_SECRET="$(openssl rand -base64 32)"
 
@@ -67,13 +66,11 @@ case "$OS" in
     ;;
 esac
 
-# ── 2. DNSSEC keys (RSA-2048, alg 8) ─────────────────────────────────────────
 echo "→ Generating DNSSEC ZSK + KSK for $ZONE"
 openssl genrsa -out "keys/K${ZONE}+008+zsk.private" 2048 2>/dev/null
 openssl genrsa -out "keys/K${ZONE}+008+ksk.private" 4096 2>/dev/null
 chmod 600 keys/*.private
 
-# ── 3. Self-signed TLS cert for DoT / DoH ────────────────────────────────────
 echo "→ Generating self-signed TLS cert (CN=localhost) for DoT/DoH"
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout tls/key.pem -out tls/cert.pem \
@@ -81,7 +78,6 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
 chmod 600 tls/key.pem
 
-# ── 4. Config that references the Keychain (no secrets in the file) ──────────
 echo "→ Writing config.toml"
 cat > config.toml <<EOF
 [server]

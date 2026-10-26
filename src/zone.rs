@@ -7,8 +7,6 @@ use std::{
 };
 use crate::proto::{Builder, RType, Record, canonical_name};
 
-// ── Zone store ───────────────────────────────────────────────────────────────
-
 pub struct Zone {
     pub origin: String,
     /// (fqdn_lower, rtype_u16) → rrset
@@ -242,7 +240,6 @@ fn base32hex_encode(input: &[u8]) -> String {
 }
 
 impl Zone {
-    // ── Zone file parser ─────────────────────────────────────────────────────
 
     /// Parse RFC 1035 zone file. Supports:
     ///   $ORIGIN, $TTL directives
@@ -361,8 +358,6 @@ impl Zone {
         Ok(())
     }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Cut a zone file line at its ';' comment, ignoring any ';' inside a quoted string.
 fn strip_zone_comment(line: &str) -> &str {

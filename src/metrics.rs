@@ -37,6 +37,12 @@ pub struct Metrics {
     total_query_time: AtomicU64,
     /// Queries processed
     query_count_for_avg: AtomicU64,
+    /// Queries dropped by the per-source or global rate limit
+    dropped_rate_limited: AtomicU64,
+    /// Recursive UDP queries dropped because the recursion pool queue was full
+    dropped_recursion_limit: AtomicU64,
+    /// TCP/DoT/DoH connections closed because every connection worker was busy
+    dropped_connections: AtomicU64,
 }
 
 impl Metrics {
@@ -54,6 +60,9 @@ impl Metrics {
             udp_queries: AtomicU64::new(0),
             total_query_time: AtomicU64::new(0),
             query_count_for_avg: AtomicU64::new(0),
+            dropped_rate_limited: AtomicU64::new(0),
+            dropped_recursion_limit: AtomicU64::new(0),
+            dropped_connections: AtomicU64::new(0),
         })
     }
 
@@ -105,6 +114,19 @@ impl Metrics {
     pub fn record_query_time(&self, duration_ns: u64) {
         self.total_query_time.fetch_add(duration_ns, Ordering::Relaxed);
         self.query_count_for_avg.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Load shedding
+    pub fn record_dropped_rate_limited(&self) {
+        self.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dropped_recursion_limit(&self) {
+        self.dropped_recursion_limit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dropped_connection(&self) {
+        self.dropped_connections.fetch_add(1, Ordering::Relaxed);
     }
 
     // Getters
@@ -183,6 +205,18 @@ impl Metrics {
         output.push_str("# HELP ironbind_query_time_ms Average query time in milliseconds\n");
         output.push_str("# TYPE ironbind_query_time_ms gauge\n");
         output.push_str(&format!("ironbind_query_time_ms {:.4}\n", self.get_avg_query_time_ms()));
+
+        output.push_str("# HELP ironbind_dropped_rate_limited Queries dropped by the rate limiter\n");
+        output.push_str("# TYPE ironbind_dropped_rate_limited counter\n");
+        output.push_str(&format!("ironbind_dropped_rate_limited {}\n", self.dropped_rate_limited.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP ironbind_dropped_recursion_limit Recursive UDP queries dropped because the recursion pool was full\n");
+        output.push_str("# TYPE ironbind_dropped_recursion_limit counter\n");
+        output.push_str(&format!("ironbind_dropped_recursion_limit {}\n", self.dropped_recursion_limit.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP ironbind_dropped_connections Connections closed because all connection workers were busy\n");
+        output.push_str("# TYPE ironbind_dropped_connections counter\n");
+        output.push_str(&format!("ironbind_dropped_connections {}\n", self.dropped_connections.load(Ordering::Relaxed)));
 
         output
     }

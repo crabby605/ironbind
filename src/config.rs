@@ -129,8 +129,6 @@ fn parse_value(s: &str) -> Option<TomlVal> {
     None
 }
 
-// ── Server config ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind:            String,
@@ -151,8 +149,11 @@ pub struct ServerConfig {
     pub rate_limit:      Option<RateLimitConfig>,
     /// HTTP port for Prometheus metrics scraping. 0 = disabled.
     pub metrics_port:    u16,
-    /// Number of worker threads in the shared query pool.
+    /// Worker threads for recursive lookups, and separately for TCP/DoT/DoH connections.
     pub worker_threads:  usize,
+    /// Threads receiving on the UDP socket and answering authoritative/cached queries.
+    /// More is not faster: they contend on the socket lock (2 measured best on a 10-core M4).
+    pub udp_receivers:   usize,
     /// DNS-over-TLS listener (typically port 853).
     pub dot:             Option<TlsListenerConfig>,
     /// DNS-over-HTTPS listener (typically port 443).
@@ -244,8 +245,13 @@ fn read_keychain(_service: &str) -> Result<String, String> {
 
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
+    /// Per source IP (ignored when per_ip is false)
     pub queries_per_second: u32,
     pub per_ip: bool,
+    /// Across all sources; 0 = no global cap
+    pub global_queries_per_second: u32,
+    /// Size limit of the per-source table
+    pub max_tracked_sources: usize,
 }
 
 impl Default for ServerConfig {
@@ -265,6 +271,7 @@ impl Default for ServerConfig {
             rate_limit:      None,
             metrics_port:    0,
             worker_threads:  64,
+            udp_receivers:   2,
             dot:             None,
             doh:             None,
             tsig_keys:       Vec::new(),
@@ -289,6 +296,7 @@ impl ServerConfig {
         if let Some(v) = t.bool(Some("server"), "log_queries") { c.log_queries = v; }
         if let Some(v) = t.int(Some("server"), "tcp_timeout_ms") { c.tcp_timeout_ms = v as u64; }
         if let Some(v) = t.int(Some("server"), "worker_threads") { c.worker_threads = v as usize; }
+        if let Some(v) = t.int(Some("server"), "udp_receivers")  { c.udp_receivers = v as usize; }
         if let Some(v) = t.int(Some("metrics"), "port") { c.metrics_port = v as u16; }
 
         if let (Some(b), Some(cert), Some(key)) = (
@@ -330,10 +338,14 @@ impl ServerConfig {
 
         c.zone_files = t.array(Some("zones"), "files");
 
-        if let Some(qps) = t.int(Some("ratelimit"), "queries_per_second") {
+        let per_source = t.int(Some("ratelimit"), "queries_per_second");
+        let global = t.int(Some("ratelimit"), "global_queries_per_second");
+        if per_source.is_some() || global.is_some() {
             c.rate_limit = Some(RateLimitConfig {
-                queries_per_second: qps as u32,
+                queries_per_second: per_source.unwrap_or(0).max(0) as u32,
                 per_ip: t.bool(Some("ratelimit"), "per_ip").unwrap_or(true),
+                global_queries_per_second: global.unwrap_or(0).max(0) as u32,
+                max_tracked_sources: t.int(Some("ratelimit"), "max_tracked_sources").unwrap_or(100_000).max(1) as usize,
             });
         }
 

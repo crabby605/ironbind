@@ -25,8 +25,6 @@ use std::{
 };
 use crate::proto::{Packet, Parser, Question, Record, RType, serialize, CLASS_IN};
 
-// ── Root hints (IANA, as of 2024) ────────────────────────────────────────────
-
 const ROOT_SERVERS: &[(&str, &str)] = &[
     ("a.root-servers.net", "198.41.0.4"),
     ("b.root-servers.net", "199.9.14.201"),
@@ -46,8 +44,6 @@ const ROOT_SERVERS: &[(&str, &str)] = &[
 const TIMEOUT_MS:   u64 = 2000;
 const MAX_REFERRALS: usize = 20;
 const DNS_PORT: u16 = 53;
-
-// ── Resolver config ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
@@ -89,16 +85,12 @@ fn parse_resolv_conf() -> Option<Vec<SocketAddr>> {
     if addrs.is_empty() { None } else { Some(addrs) }
 }
 
-// ── Resolve result ────────────────────────────────────────────────────────────
-
 #[derive(Debug)]
 pub enum ResolveResult {
     Answer(Packet),
     NxDomain(Packet),
     ServFail(String),
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 pub struct Resolver {
     pub config: ResolverConfig,
@@ -298,8 +290,6 @@ impl Resolver {
         }
     }
 }
-
-// ── Wire helpers ──────────────────────────────────────────────────────────────
 
 /// Build a recursive query with EDNS0 + DO bit set, used for DNSSEC fetches.
 fn build_query_dnssec(name: &str, qtype: &RType) -> Vec<u8> {

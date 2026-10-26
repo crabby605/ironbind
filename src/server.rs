@@ -12,7 +12,7 @@
 /// - Thread-per-query model: simple but effective for moderate load
 use std::{
     io::{Read, Write},
-    net::{IpAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::Arc,
     thread,
     time::Duration,
@@ -41,8 +41,6 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::RwLock;
 use std::time::Instant;
 
-// ── Server state (shared across threads) ─────────────────────────────────────
-//
 // State is wrapped in Arc (atomic reference count) so each thread has a shared
 // reference to the same zones, cache, resolver, and config without copying.
 
@@ -60,8 +58,46 @@ pub struct State {
 /// Public re-export so DoT/DoH modules can invoke the standard query pipeline.
 /// Signs the response with TSIG when the request was signed with a known key.
 pub fn handle_query_public(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> {
-    let resp = handle_query(data, state, peer_ip)?;
-    Some(maybe_sign_response(data, resp, state))
+    if !admit(state, peer_ip) { return None; }
+    match respond(data, state, peer_ip, Recursion::Inline) {
+        Answer::Ready(resp) => resp,
+        Answer::Recursive   => None,
+    }
+}
+
+fn respond(data: &[u8], state: &State, peer_ip: IpAddr, recursion: Recursion) -> Answer {
+    match handle_query(data, state, peer_ip, recursion) {
+        Answer::Ready(Some(resp)) => Answer::Ready(Some(maybe_sign_response(data, resp, state))),
+        other => other,
+    }
+}
+
+/// How a query that needs an upstream lookup is handled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recursion {
+    /// Resolve on the calling thread (TCP/DoT/DoH connection workers)
+    Inline,
+    /// Return `Answer::Recursive` so a UDP receiver can hand the query off
+    Defer,
+    /// The handed-off query running on the recursion pool
+    Resume,
+}
+
+enum Answer {
+    /// Bytes to send back, or nothing
+    Ready(Option<Vec<u8>>),
+    /// Needs an upstream lookup on the recursion pool
+    Recursive,
+}
+
+/// Rate limit check, done before any parsing so floods cost as little as possible.
+/// Dropped silently (RFC 5358 recommendation) and counted in metrics.
+fn admit(state: &State, peer_ip: IpAddr) -> bool {
+    let Some(rate_limiter) = &state.rate_limiter else { return true };
+    if rate_limiter.check(peer_ip) { return true; }
+    state.metrics.record_dropped_rate_limited();
+    if state.config.log_queries { eprintln!("[ratelimit] dropped query from {}", peer_ip); }
+    false
 }
 
 fn maybe_sign_response(req: &[u8], resp: Vec<u8>, state: &State) -> Vec<u8> {
@@ -79,8 +115,6 @@ fn maybe_sign_response(req: &[u8], resp: Vec<u8>, state: &State) -> Vec<u8> {
     sign_message(&resp, key)
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-//
 // Spawns:
 // 1. Cache eviction thread: purges expired entries every 60 seconds
 // 2. TCP listener thread: accepts TCP connections on configured address
@@ -124,11 +158,11 @@ pub fn run(state: Arc<State>) {
         spawn_supervised("metrics", move || metrics_server(port, Arc::clone(&metrics)));
     }
 
-    // Bounded worker pools. Connections (TCP/DoT/DoH) get their own pool so idle
-    // or slow clients can't hold the workers that answer UDP.
+    // Connections (TCP/DoT/DoH) and recursive UDP lookups each get a bounded pool,
+    // so neither idle clients nor slow upstream servers can hold the UDP receivers.
     let workers = state.config.worker_threads.max(1);
-    let pool = Arc::new(ThreadPool::new("udp", workers, workers * UDP_QUEUE_PER_WORKER));
     let connection_pool = Arc::new(ThreadPool::new("conn", workers, workers));
+    let recursion_pool = Arc::new(ThreadPool::new("recursion", workers, workers * RECURSION_QUEUE_PER_WORKER));
 
     // Optional DoT/DoH listeners
     if let Some(dot) = &state.config.dot {
@@ -156,14 +190,19 @@ pub fn run(state: Arc<State>) {
         let addr  = addr.clone();
         let pool  = Arc::clone(&connection_pool);
         spawn_supervised("tcp", move || {
-            let listener = TcpListener::bind(&addr).expect("TCP bind failed");
+            let listener = match TcpListener::bind(&addr) {
+                Ok(listener) => listener,
+                Err(e) => { eprintln!("[tcp] bind {}: {}", addr, e); return; }
+            };
             eprintln!("[tcp] listening on {}", addr);
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
                         let st = Arc::clone(&state);
                         // Every worker busy: the connection is closed instead of queued
-                        pool.submit(move || handle_tcp(s, st));
+                        if !pool.submit(move || handle_tcp(s, st)) {
+                            state.metrics.record_dropped_connection();
+                        }
                     }
                     Err(e) => eprintln!("[tcp] accept: {}", e),
                 }
@@ -171,48 +210,85 @@ pub fn run(state: Arc<State>) {
         });
     }
 
-    // UDP main loop
-    // UDP main loop, restarted in place if it ever panics
-    run_supervised("udp", || udp_loop(&addr, &state, &pool));
+    // UDP receivers, restarted in place if they ever stop
+    run_supervised("udp", || udp_loop(&addr, &state, &recursion_pool));
 }
 
-fn udp_loop(addr: &str, state: &Arc<State>, pool: &Arc<ThreadPool>) {
-    // One socket shared by every worker; cloning it per packet runs out of file descriptors under load
-    let sock = Arc::new(UdpSocket::bind(addr).expect("UDP bind failed"));
+/// A few receiver threads block on the same socket and answer authoritative and
+/// cached queries themselves, so the fast path has no hand-off queue: the kernel's
+/// socket buffer is the queue, and when it is full the kernel drops the newest
+/// packet (clients retry). More receivers than `udp_receivers` contend on the
+/// socket lock and answer fewer queries, not more.
+fn udp_loop(addr: &str, state: &Arc<State>, recursion_pool: &Arc<ThreadPool>) {
+    let sock = match UdpSocket::bind(addr) {
+        Ok(sock) => Arc::new(sock),
+        Err(e) => { eprintln!("[udp] bind {}: {}", addr, e); return; }
+    };
     eprintln!("[udp] listening on {}", addr);
 
-    let mut buf = vec![0u8; 4096];
+    let receivers: Vec<_> = (0..state.config.udp_receivers.max(1))
+        .filter_map(|index| {
+            let (sock, state, recursion_pool) = (Arc::clone(&sock), Arc::clone(state), Arc::clone(recursion_pool));
+            thread::Builder::new()
+                .name(format!("udp-receiver-{}", index))
+                .spawn(move || udp_receiver(&sock, &state, &recursion_pool))
+                .map_err(|e| eprintln!("[udp] spawn receiver: {}", e))
+                .ok()
+        })
+        .collect();
+    // Returns only once every receiver has stopped, and the supervisor rebinds
+    for receiver in receivers { let _ = receiver.join(); }
+}
+
+fn udp_receiver(sock: &Arc<UdpSocket>, state: &Arc<State>, recursion_pool: &ThreadPool) {
+    let mut buf = [0u8; 4096];
     loop {
-        match sock.recv_from(&mut buf) {
-            Ok((len, peer)) => {
-                let data = buf[..len].to_vec();
-                let st   = Arc::clone(state);
-                let sock = Arc::clone(&sock);
-                // Queue full: drop the packet, the client retries (same as a full socket buffer)
-                pool.submit(move || {
-                    st.metrics.record_udp_query();
-                    let resp = handle_query_public(&data, &st, peer.ip());
-                    if let Some(r) = resp {
-                        // UDP max is the client's EDNS payload size, or 512 without EDNS (RFC 6891 §6.2.5)
-                        let max = Parser::new(&data).parse()
-                            .map(|query| (query.edns_udp_size as usize).clamp(512, 4096))
-                            .unwrap_or(512);
-                        let r = if r.len() > max {
-                            build_truncated(&data)
-                        } else {
-                            r
-                        };
-                        let _ = sock.send_to(&r, peer);
+        let (len, peer) = match sock.recv_from(&mut buf) {
+            Ok(received) => received,
+            Err(e) => {
+                if state.config.log_queries { eprintln!("[udp] recv: {}", e); }
+                continue;
+            }
+        };
+        if !admit(state, peer.ip()) { continue; }
+        state.metrics.record_udp_query();
+
+        let data = &buf[..len];
+        match answer_catching_panics(data, state, peer, Recursion::Defer) {
+            Answer::Ready(Some(resp)) => send_udp(sock, data, resp, peer),
+            Answer::Ready(None) => {}
+            Answer::Recursive => {
+                let (data, sock, job_state) = (data.to_vec(), Arc::clone(sock), Arc::clone(state));
+                let queued = recursion_pool.submit(move || {
+                    if let Answer::Ready(Some(resp)) = answer_catching_panics(&data, &job_state, peer, Recursion::Resume) {
+                        send_udp(&sock, &data, resp, peer);
                     }
                 });
+                // Recursion pool full: drop the newest query, the client retries
+                if !queued { state.metrics.record_dropped_recursion_limit(); }
             }
-            Err(e) => eprintln!("[udp] recv: {}", e),
         }
     }
 }
 
-// ── Supervision ───────────────────────────────────────────────────────────────
-//
+/// A query that panics is answered with nothing; the thread keeps going.
+fn answer_catching_panics(data: &[u8], state: &State, peer: SocketAddr, recursion: Recursion) -> Answer {
+    panic::catch_unwind(AssertUnwindSafe(|| respond(data, state, peer.ip(), recursion)))
+        .unwrap_or_else(|_| {
+            eprintln!("[udp] query from {} panicked", peer.ip());
+            Answer::Ready(None)
+        })
+}
+
+fn send_udp(sock: &UdpSocket, query: &[u8], resp: Vec<u8>, peer: SocketAddr) {
+    // UDP max is the client's EDNS payload size, or 512 without EDNS (RFC 6891 §6.2.5)
+    let max = Parser::new(query).parse()
+        .map(|parsed| (parsed.edns_udp_size as usize).clamp(512, 4096))
+        .unwrap_or(512);
+    let resp = if resp.len() > max { build_truncated(query) } else { resp };
+    let _ = sock.send_to(&resp, peer);
+}
+
 // Every long-running loop runs under a supervisor: if it panics or returns
 // (a bind failed, a listener died) it is started again after a backoff of
 // 1s doubling to 30s, reset once the loop has stayed up for a minute.
@@ -235,8 +311,6 @@ fn spawn_supervised<F: Fn() + Send + 'static>(name: &'static str, job: F) {
     thread::spawn(move || run_supervised(name, job));
 }
 
-// ── Query handler ─────────────────────────────────────────────────────────────
-//
 // Resolution flow for each query:
 // 1. Rate limit check: if too many queries from this IP, drop silently (RFC 5358)
 // 2. Parse DNS packet from wire format
@@ -249,17 +323,14 @@ fn spawn_supervised<F: Fn() + Send + 'static>(name: &'static str, job: F) {
 //
 // Returns: Some(bytes) to send response, None to drop query
 
-fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> {
+fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr, recursion: Recursion) -> Answer {
     let start = Instant::now();
-    state.metrics.record_query();
+    // A deferred query was already counted when the receiver first saw it
+    if recursion != Recursion::Resume { state.metrics.record_query(); }
 
-    // Rate limit check
-    if let Some(rl) = &state.rate_limiter {
-        if !rl.check(peer_ip) {
-            if state.config.log_queries { eprintln!("[ratelimit] dropped query from {}", peer_ip); }
-            return None; // drop silently (RFC 5358 recommendation)
-        }
-    }
+    // Never answer a response, not even with an error: spoofed responses would
+    // otherwise bounce traffic between servers.
+    if data.len() < 3 || data[2] & 0x80 != 0 { return Answer::Ready(None); }
 
     // Enforce TSIG on every query when configured. AXFR/IXFR have their own
     // mandatory check in maybe_zone_transfer.
@@ -269,7 +340,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
             let id = if data.len() >= 2 { u16::from_be_bytes([data[0], data[1]]) } else { 0 };
             let mut r = Packet::new_response(id, 0);
             r.set_rcode(RCODE_REFUSED);
-            return Some(serialize(&r, false));
+            return Answer::Ready(Some(serialize(&r, false)));
         }
     }
 
@@ -277,20 +348,20 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
         Ok(p) => p,
         Err(e) => {
             if state.config.log_queries { eprintln!("[parse] {} {}", peer_ip, e); }
-            return Some(formerr_response(data));
+            return Answer::Ready(Some(formerr_response(data)));
         }
     };
 
+    if pkt.is_response() { return Answer::Ready(None); }
+
     // Only handle standard queries (OPCODE=0)
     if pkt.opcode() != 0 {
-        return Some(error_response(&pkt, RCODE_NOTIMP));
+        return Answer::Ready(Some(error_response(&pkt, RCODE_NOTIMP)));
     }
-
-    if pkt.is_response() { return None; }
 
     let q = match pkt.questions.first() {
         Some(q) => q.clone(),
-        None    => return Some(error_response(&pkt, RCODE_NOERROR)),
+        None    => return Answer::Ready(Some(error_response(&pkt, RCODE_NOERROR))),
     };
 
     if state.config.log_queries { log_query(&q, &peer_ip); }
@@ -301,7 +372,6 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     resp.edns_udp_size = if pkt.edns_udp_size > 0 { pkt.edns_udp_size } else { 0 };
     resp.dnssec_ok = pkt.dnssec_ok;
 
-    // ── 1. Authoritative zone lookup ─────────────────────────────────────────
     // The most specific zone wins, so a child zone is not shadowed by its parent.
     let zones_snapshot: Vec<Arc<Zone>> = state.zones.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let authoritative_zone = zones_snapshot.iter()
@@ -340,7 +410,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
         if answered {
             state.metrics.record_success();
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-            return Some(serialize(&resp, resp.edns_udp_size > 0));
+            return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
         }
 
         // Add SOA to authority for both negative answers (RFC 2308 §3)
@@ -363,7 +433,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
             }
             state.metrics.record_success();
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-            return Some(serialize(&resp, resp.edns_udp_size > 0));
+            return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
         }
 
         // NXDOMAIN
@@ -382,46 +452,46 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
         }
         state.metrics.record_nxdomain();
         state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-        return Some(serialize(&resp, resp.edns_udp_size > 0));
+        return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
     }
 
-    // ── 2. Cache lookup ──────────────────────────────────────────────────────
     match state.cache.get(&q.name, &q.qtype) {
         Some(CacheValue::Records(records)) => {
             state.metrics.record_cache_hit();
             state.metrics.record_success();
             resp.answers = records;
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-            return Some(serialize(&resp, resp.edns_udp_size > 0));
+            return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
         }
         Some(CacheValue::Negative(NegativeKind::NxDomain)) => {
             state.metrics.record_cache_hit();
             state.metrics.record_nxdomain();
             resp.set_rcode(RCODE_NXDOMAIN);
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-            return Some(serialize(&resp, resp.edns_udp_size > 0));
+            return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
         }
         Some(CacheValue::Negative(NegativeKind::NoData)) => {
             state.metrics.record_cache_hit();
             state.metrics.record_success();
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-            return Some(serialize(&resp, resp.edns_udp_size > 0));
+            return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
         }
-        None => { state.metrics.record_cache_miss(); }
+        None => if recursion != Recursion::Resume { state.metrics.record_cache_miss(); },
     }
 
-    // ── 3. Recursive resolution ───────────────────────────────────────────────
     if !pkt.rd() {
         // Recursion not desired and we have no answer
         resp.set_rcode(RCODE_REFUSED);
-        return Some(serialize(&resp, resp.edns_udp_size > 0));
+        return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
     }
 
     resp.set_ra();
 
+    // UDP receivers hand upstream lookups to the recursion pool instead of waiting on them
+    if recursion == Recursion::Defer { return Answer::Recursive; }
+
     match state.resolver.resolve(&q.name, &q.qtype) {
         ResolveResult::Answer(upstream) => {
-            // ── 4. DNSSEC validation ─────────────────────────────────────────
             if state.config.dnssec_validate && pkt.dnssec_ok && !upstream.answers.is_empty() {
                 let rrsigs: Vec<Record> = upstream.answers.iter()
                     .filter(|r| r.rtype == RType::RRSIG)
@@ -455,7 +525,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
                             state.metrics.record_servfail();
                             resp.set_rcode(RCODE_SERVFAIL);
                             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-                            return Some(serialize(&resp, resp.edns_udp_size > 0));
+                            return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
                         }
                         ValidationResult::Secure => {
                             if state.config.log_queries { eprintln!("[dnssec] SECURE: {}", q.name); }
@@ -516,11 +586,11 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
         state.metrics.record_success();
     }
     state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
-    Some(serialize(&resp, resp.edns_udp_size > 0))
+    Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)))
 }
 
-/// Queued UDP queries allowed per worker before new packets are dropped.
-const UDP_QUEUE_PER_WORKER: usize = 64;
+/// Queued recursive UDP lookups allowed per recursion worker before new ones are dropped.
+const RECURSION_QUEUE_PER_WORKER: usize = 16;
 
 /// Longest CNAME chain followed inside an authoritative zone before giving up.
 const MAX_CNAME_CHAIN: usize = 8;
@@ -537,8 +607,6 @@ fn covering_rrsigs(zone: &Zone, name: &str, covered_type: &RType) -> Vec<Record>
             .collect())
         .unwrap_or_default()
 }
-
-// ── TCP handler (RFC 1035 §4.2.2 — 2-byte length prefix) ─────────────────────
 
 fn metrics_server(port: u16, metrics: Arc<Metrics>) {
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
@@ -651,8 +719,6 @@ fn maybe_zone_transfer(data: &[u8], state: &State) -> Option<Vec<Vec<u8>>> {
 
     Some(packets)
 }
-
-// ── Error responses ───────────────────────────────────────────────────────────
 
 fn error_response(pkt: &Packet, rcode: u8) -> Vec<u8> {
     let mut r = Packet::new_response(pkt.id, pkt.flags);

@@ -29,7 +29,6 @@ use zone_manager::ZoneManager;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // ── Load config ──────────────────────────────────────────────────────────
     let cfg = if let Some(path) = args.get(1) {
         match ServerConfig::load(path) {
             Ok(c) => {
@@ -51,7 +50,6 @@ fn main() {
     eprintln!("[config] bind={} dnssec_validate={} use_forwarders={}",
         cfg.bind_addr(), cfg.dnssec_validate, cfg.use_forwarders);
 
-    // ── Load zones via ZoneManager (supports SIGHUP reload) ──────────────────
     let mut zone_manager = ZoneManager::new();
     for path in &cfg.zone_files {
         let origin = std::path::Path::new(path)
@@ -93,18 +91,17 @@ fn main() {
         zones.push(Arc::new(z));
     }
 
-    // ── Resolver ─────────────────────────────────────────────────────────────
     let mut res_cfg = ResolverConfig::from_resolv_conf();
     res_cfg.use_forwarders = cfg.use_forwarders;
     res_cfg.log_queries = cfg.log_queries;
 
-    // ── Rate limiter ─────────────────────────────────────────────────────────
     let rate_limiter = cfg.rate_limit.as_ref().map(|rl| {
-        eprintln!("[ratelimit] {} qps per-ip={}", rl.queries_per_second, rl.per_ip);
-        Arc::new(RateLimiter::new(rl.queries_per_second))
+        eprintln!("[ratelimit] {} qps per-ip={} global={} qps, tracking up to {} sources",
+            rl.queries_per_second, rl.per_ip, rl.global_queries_per_second, rl.max_tracked_sources);
+        let per_source = if rl.per_ip { rl.queries_per_second } else { 0 };
+        Arc::new(RateLimiter::new(per_source, rl.global_queries_per_second, rl.max_tracked_sources))
     });
 
-    // ── TSIG keyring (secrets resolved from Keychain, file, or inline) ───────
     let mut keyring = TsigKeyring::new();
     for k in &cfg.tsig_keys {
         match k.secret_source.resolve() {
@@ -120,7 +117,6 @@ fn main() {
         }
     }
 
-    // ── Assemble state ────────────────────────────────────────────────────────
     let state = Arc::new(server::State {
         zones:        RwLock::new(zones),
         cache:        Arc::new(cache::Cache::new()),
@@ -132,10 +128,8 @@ fn main() {
         tsig_keys:    Arc::new(keyring),
     });
 
-    // ── Signal handlers ──────────────────────────────────────────────────────
     signals::setup_signal_handler();
 
-    // ── Run ───────────────────────────────────────────────────────────────────
     eprintln!("[ironbind] starting up");
     server::run(state);
 }

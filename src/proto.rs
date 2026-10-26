@@ -102,13 +102,9 @@ impl From<&RType> for u16 {
     }
 }
 
-// ── DNS Classes ──────────────────────────────────────────────────────────────
-
 pub const CLASS_IN:   u16 = 1;
 pub const CLASS_ANY:  u16 = 255;
 pub const CLASS_NONE: u16 = 254;
-
-// ── RCODE values ─────────────────────────────────────────────────────────────
 
 pub const RCODE_NOERROR:  u8 = 0;
 pub const RCODE_FORMERR:  u8 = 1;
@@ -116,8 +112,6 @@ pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
 pub const RCODE_NOTIMP:   u8 = 4;
 pub const RCODE_REFUSED:  u8 = 5;
-
-// ── Packet structures ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct Question {
@@ -235,8 +229,6 @@ impl Packet {
     pub fn opcode(&self) -> u8 { ((self.flags >> 11) & 0xF) as u8 }
 }
 
-// ── Parser: Wire Format → Rust Structures ─────────────────────────────────────
-//
 // Converts raw DNS wire format (bytes) into Rust structures.
 // Handles:
 // - DNS name compression (RFC 1035 §4.1.4): names use pointers to avoid repetition
@@ -380,8 +372,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-// ── RRSIG / DNSKEY / DS parsers ──────────────────────────────────────────────
-
 pub fn parse_rrsig(rdata: &[u8]) -> io::Result<Rrsig> {
     let mut p = Parser::new(rdata);
     let type_covered  = p.u16()?;
@@ -414,8 +404,6 @@ pub fn parse_ds(rdata: &[u8]) -> io::Result<Ds> {
     Ok(Ds { key_tag, algorithm, digest_type, digest })
 }
 
-// ── Serializer: Rust Structures → Wire Format ──────────────────────────────────
-//
 // Converts Rust structures into raw DNS wire format (bytes).
 // Handles:
 // - Efficient name compression: stores name offsets to reuse common suffixes

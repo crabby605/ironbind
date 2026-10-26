@@ -66,7 +66,8 @@ pub fn sign_message(message: &[u8], key: &TsigKey) -> Vec<u8> {
     to_sign.extend_from_slice(message);
     extend_tsig_variables(&mut to_sign, &key.name, &key.algorithm, now, fudge, 0, &[]);
 
-    let mut mac = HmacSha256::new_from_slice(&key.secret).expect("hmac key");
+    // HMAC accepts keys of any length, so this only fails if that ever changes
+    let Ok(mut mac) = HmacSha256::new_from_slice(&key.secret) else { return message.to_vec() };
     mac.update(&to_sign);
     let mac_bytes = mac.finalize().into_bytes().to_vec();
 
@@ -123,7 +124,8 @@ fn extract_tsig(message: &[u8]) -> Result<(String, TsigRdata, usize, u16), Strin
     let mut p = Parser::new(message);
     p.pos = 12;
     for _ in 0..qd { let _ = p.name().map_err(|e| e.to_string())?; p.pos += 4; }
-    for _ in 0..(an + ns + arcount - 1) { skip_rr(&mut p)?; }
+    // Counts come straight from the packet: add them in u32 so they can't overflow
+    for _ in 0..(an as u32 + ns as u32 + arcount as u32 - 1) { skip_rr(&mut p)?; }
 
     let tsig_offset = p.pos;
     let name = p.name().map_err(|e| e.to_string())?;

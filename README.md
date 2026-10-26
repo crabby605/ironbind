@@ -16,10 +16,10 @@ A BIND-shaped authoritative + recursive DNS server, written from scratch in Rust
 - **TSIG (HMAC-SHA256)** signing and verification on transfers and (optionally) every query (RFC 8945)
 - **DNS-over-TLS** (RFC 7858) and **DNS-over-HTTPS** (RFC 8484) via `rustls`
 - **Positive + negative caching** (RFC 2308) with TTL eviction
-- **Rate limiting** per source IP
+- **Rate limiting** per source IP (bounded table, so spoofed floods can't grow it) and globally
 - **Prometheus `/metrics`** endpoint with query, cache, RCODE, DNSSEC, and latency counters
 - **SIGHUP hot reload** — `kill -HUP` swaps in new zones atomically without dropping queries
-- **Bounded worker pools** — floods are shed instead of queued without limit; TCP/DoT/DoH run on their own pool so idle connections can't starve UDP
+- **Load shedding** — UDP receivers answer authoritative and cached queries inline; recursion, TCP/DoT/DoH each run on bounded pools that drop the newest work when full, counted in metrics
 - **Self-healing** — a panicking query is contained to its worker, and every listener restarts itself with backoff if it dies or fails to bind
 - **IPv4 + IPv6** binds (v6 literals auto-bracketed)
 
@@ -78,7 +78,8 @@ Full annotated `config.toml`:
 [server]
 bind             = "0.0.0.0"     # or "::" for IPv6, or any literal
 port             = 5000          # 5353 clashes with mDNSResponder on macOS
-worker_threads   = 64
+worker_threads   = 64            # recursion pool and connection pool size
+udp_receivers    = 2             # threads reading the UDP socket; more contend and get slower
 use_forwarders   = true          # try /etc/resolv.conf before iterative
 dnssec_validate  = true          # validate RRSIGs on recursive answers
 dnssec_strict    = false         # if true, walk full chain from IANA anchors
@@ -93,8 +94,10 @@ max_entries = 100000
 neg_ttl     = 300
 
 [ratelimit]
-queries_per_second = 1000
-per_ip             = true
+queries_per_second        = 1000     # per source IP
+per_ip                    = true
+global_queries_per_second = 200000   # across all sources; still holds when sources are spoofed
+max_tracked_sources       = 100000   # size limit of the per-source table
 
 [metrics]
 port = 9090                      # 0 disables Prometheus endpoint
@@ -192,21 +195,27 @@ ironbind_responses_servfail      SERVFAIL
 ironbind_dnssec_valid            SECURE validations
 ironbind_dnssec_bogus            BOGUS validations
 ironbind_query_time_ms           avg latency
+ironbind_dropped_rate_limited    queries dropped by the rate limiter
+ironbind_dropped_recursion_limit recursive UDP queries dropped, recursion pool full
+ironbind_dropped_connections     TCP/DoT/DoH connections closed, all workers busy
 ```
 
 ## Resilience
 
-Load-tested on loopback (Apple M4, 10 cores) with a Python client, which is the bottleneck for the per-query numbers:
+Load-tested on loopback on an Apple M4 (10 cores), with the load generator sharing those cores:
 
 | Scenario | Result |
 |----------|--------|
-| Mixed authoritative queries, UDP | ~95k qps, 100% answered, 0 wrong |
-| Pipelined TCP | ~150k qps, 100% answered, 0 wrong |
-| UDP flood at 250k–466k packets/s | excess dropped, memory flat at ~17 MB, answers again immediately after |
-| 4M fuzzed / malformed packets | no crashes |
+| UDP, 200k queries/s offered | 200k/s answered, 100% |
+| UDP, 400k–825k packets/s offered | ~210k/s answered at best; the rest dropped by the kernel, server stays up at ~16 MB |
+| Pipelined TCP | ~160k qps, 100% answered, 0 wrong |
+| 12M fuzzed / malformed packets, with and without TSIG enforced | no crashes |
 | 200 idle TCP connections | UDP latency unchanged (0.1 ms) |
+| Listener port taken at startup | retried with backoff, came up once the port was free |
 
-In-process recovery covers panics and failed binds. For crashes nothing in-process can catch (OOM kill, `SIGKILL`), run it under a supervisor: `Restart=always` in a systemd unit, or `KeepAlive` in a launchd plist.
+macOS loopback tops out around 800k packets/s, so floods beyond that need a separate load box.
+
+A panicking query is contained to that query, and every listener restarts itself with backoff. For failures nothing in-process can catch (OOM kill, `SIGKILL`), `ironbind.service` runs it under systemd with `Restart=always` and a raised `LimitNOFILE`; install steps are at the top of the file.
 
 ## Testing
 

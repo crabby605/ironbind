@@ -36,7 +36,8 @@ pub fn run(bind: String, cert_path: String, key_path: String, state: Arc<State>,
         let timeout = Some(std::time::Duration::from_millis(state.config.tcp_timeout_ms));
         let _ = stream.set_read_timeout(timeout);
         let _ = stream.set_write_timeout(timeout);
-        pool.submit(move || {
+        let metrics = Arc::clone(&state.metrics);
+        let accepted = pool.submit(move || {
             let conn = match ServerConnection::new(tls_cfg) {
                 Ok(c) => c,
                 Err(e) => { eprintln!("[doh] tls handshake init: {}", e); return; }
@@ -44,6 +45,8 @@ pub fn run(bind: String, cert_path: String, key_path: String, state: Arc<State>,
             let mut tls = StreamOwned::new(conn, stream);
             handle_http(&mut tls, &state, peer_ip);
         });
+        // Every connection worker busy: the connection is closed instead of queued
+        if !accepted { metrics.record_dropped_connection(); }
     }
 }
 

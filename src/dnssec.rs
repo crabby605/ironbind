@@ -16,8 +16,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::proto::{Record, RType, parse_rrsig, parse_dnskey, parse_ds, canonical_rr, canonical_name, Builder};
 
-// ── Algorithm IDs (RFC 8624) ─────────────────────────────────────────────────
-
 pub const ALG_RSAMD5:         u8 = 1;   // MUST NOT implement
 pub const ALG_DSA:            u8 = 3;   // MUST NOT implement
 pub const ALG_RSASHA1:        u8 = 5;   // NOT RECOMMENDED
@@ -31,14 +29,10 @@ pub const ALG_ECDSAP384SHA384:u8 = 14;  // RECOMMENDED
 pub const ALG_ED25519:        u8 = 15;  // RECOMMENDED
 pub const ALG_ED448:          u8 = 16;
 
-// ── Digest type IDs ──────────────────────────────────────────────────────────
-
 pub const DIGEST_SHA1:   u8 = 1;  // MUST NOT use (deprecated)
 pub const DIGEST_SHA256: u8 = 2;  // MUST implement
 pub const DIGEST_GOST:   u8 = 3;
 pub const DIGEST_SHA384: u8 = 4;  // RECOMMENDED
-
-// ── Validation result ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
@@ -47,8 +41,6 @@ pub enum ValidationResult {
     Bogus(String),// Chain exists but verification failed
     Indeterminate,
 }
-
-// ── DNSSEC Validator ─────────────────────────────────────────────────────────
 
 pub struct Validator;
 
@@ -239,8 +231,6 @@ impl Validator {
     }
 }
 
-// ── Signed data construction (RFC 4034 §6.2) ────────────────────────────────
-
 pub(crate) fn build_signed_data(rrsig: &crate::proto::Rrsig, rrset: &[Record]) -> Vec<u8> {
     let mut data = Vec::new();
 
@@ -268,8 +258,6 @@ pub(crate) fn build_signed_data(rrsig: &crate::proto::Rrsig, rrset: &[Record]) -
 
     data
 }
-
-// ── Signature verification ───────────────────────────────────────────────────
 
 fn verify_signature(algorithm: u8, pubkey: &[u8], data: &[u8], signature: &[u8]) -> Result<bool, String> {
     match algorithm {
@@ -375,7 +363,6 @@ fn parse_rsa_pubkey(key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((rest[..exp_len].to_vec(), rest[exp_len..].to_vec()))
 }
 
-// ── Pure-std SHA implementations ──────────────────────────────────────────────
 // SHA-256 per FIPS 180-4
 
 const K256: [u32; 64] = [
