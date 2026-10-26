@@ -37,8 +37,14 @@ impl Zone {
         self.rrsets.get(&key)
     }
 
+    /// True for names that own records and for empty non-terminals
+    /// (e.g. `_tcp.example.com` when only `_http._tcp.example.com` exists),
+    /// which must answer NODATA rather than NXDOMAIN (RFC 8020).
     pub fn name_exists(&self, name: &str) -> bool {
-        self.names.contains_key(&name.to_ascii_lowercase())
+        let lower = name.to_ascii_lowercase();
+        let descendant_suffix = format!(".{}", lower);
+        self.names.contains_key(&lower)
+            || self.names.keys().any(|existing| existing.ends_with(&descendant_suffix))
     }
 
     pub fn is_authoritative_for(&self, name: &str) -> bool {
@@ -247,13 +253,26 @@ impl Zone {
         let mut origin = self.origin.clone();
         let mut last_name = origin.clone();
 
+        // A record wrapped in parentheses (RFC 1035 §5.1) spans several lines,
+        // so lines are buffered until every opening parenthesis is closed.
+        let mut pending_record = String::new();
+        let mut open_parentheses: i32 = 0;
+
         for raw_line in content.lines() {
-            // Strip inline comments
-            let line = match raw_line.find(';') {
-                Some(i) => &raw_line[..i],
-                None    => raw_line,
-            };
-            let line = line.trim();
+            // Strip inline comments, but keep ';' that sits inside a quoted string
+            let without_comment = strip_zone_comment(raw_line);
+            if pending_record.is_empty() && without_comment.trim().is_empty() { continue; }
+
+            pending_record.push_str(without_comment);
+            pending_record.push(' ');
+            open_parentheses += parenthesis_balance(without_comment);
+            if open_parentheses > 0 { continue; }
+            open_parentheses = 0;
+
+            let record_text = std::mem::take(&mut pending_record);
+            // An owner field left blank (line starts with whitespace) reuses the previous owner
+            let owner_is_blank = record_text.starts_with(char::is_whitespace);
+            let line = record_text.trim();
             if line.is_empty() { continue; }
 
             // Directives
@@ -272,15 +291,21 @@ impl Zone {
                 }
                 continue;
             }
+            // Unsupported directives such as $INCLUDE must not be read as owner names
+            if line.starts_with('$') {
+                eprintln!("[zone] unsupported directive: {}", line);
+                continue;
+            }
 
             // RR line: [name] [ttl] [class] type rdata...
-            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let owned_tokens = tokenize_zone_line(line);
+            let tokens: Vec<&str> = owned_tokens.iter().map(String::as_str).collect();
             if tokens.len() < 2 { continue; }
 
             let mut idx = 0;
 
             // Name field — blank means reuse last_name
-            let name = if tokens[0].starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '*' || c == '@') && !is_type(tokens[0]) {
+            let name = if !owner_is_blank && !is_type(tokens[0]) && !is_class(tokens[0]) {
                 idx = 1;
                 let n = tokens[0];
                 let fqdn = if n == "@" {
@@ -306,7 +331,7 @@ impl Zone {
 
             // Optional class (IN/ANY — skip)
             if let Some(cls) = tokens.get(idx) {
-                if matches!(cls.to_uppercase().as_str(), "IN" | "ANY" | "CH" | "HS") {
+                if is_class(cls) {
                     idx += 1;
                 }
             }
@@ -338,6 +363,73 @@ impl Zone {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Cut a zone file line at its ';' comment, ignoring any ';' inside a quoted string.
+fn strip_zone_comment(line: &str) -> &str {
+    let mut inside_quotes = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => inside_quotes = !inside_quotes,
+            ';' if !inside_quotes => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Opening minus closing parentheses outside quoted strings.
+fn parenthesis_balance(line: &str) -> i32 {
+    let mut inside_quotes = false;
+    let mut escaped = false;
+    let mut balance = 0;
+    for character in line.chars() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => inside_quotes = !inside_quotes,
+            '(' if !inside_quotes => balance += 1,
+            ')' if !inside_quotes => balance -= 1,
+            _ => {}
+        }
+    }
+    balance
+}
+
+/// Split a record into fields on whitespace. A quoted string stays one field
+/// (quotes included) and grouping parentheses are dropped.
+fn tokenize_zone_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current_token = String::new();
+    let mut inside_quotes = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            current_token.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => { current_token.push(character); escaped = true; }
+            '"' => { current_token.push(character); inside_quotes = !inside_quotes; }
+            '(' | ')' if !inside_quotes => {
+                if !current_token.is_empty() { tokens.push(std::mem::take(&mut current_token)); }
+            }
+            _ if character.is_whitespace() && !inside_quotes => {
+                if !current_token.is_empty() { tokens.push(std::mem::take(&mut current_token)); }
+            }
+            _ => current_token.push(character),
+        }
+    }
+    if !current_token.is_empty() { tokens.push(current_token); }
+    tokens
+}
+
+fn is_class(s: &str) -> bool {
+    matches!(s.to_uppercase().as_str(), "IN" | "ANY" | "CH" | "HS")
+}
 
 fn is_type(s: &str) -> bool {
     matches!(s.to_uppercase().as_str(),
@@ -424,15 +516,19 @@ fn build_rdata(rtype: &str, tokens: &[&str], origin: &str) -> Option<Vec<u8>> {
             Some(b.finish())
         }
         "TXT" => {
-            // Join all tokens, strip quotes
-            let joined = tokens.join(" ");
-            let text = joined.trim_matches('"');
-            // Each string segment ≤255 bytes
-            let bytes = text.as_bytes();
+            // Every field is its own character-string; quotes are stripped
             let mut out = Vec::new();
-            for chunk in bytes.chunks(255) {
-                out.push(chunk.len() as u8);
-                out.extend_from_slice(chunk);
+            for token in tokens {
+                let text = token.strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .unwrap_or(token);
+                let bytes = text.as_bytes();
+                if bytes.is_empty() { out.push(0); }
+                // Each string segment ≤255 bytes
+                for chunk in bytes.chunks(255) {
+                    out.push(chunk.len() as u8);
+                    out.extend_from_slice(chunk);
+                }
             }
             Some(out)
         }
@@ -508,4 +604,45 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         if chunk[3] != b'=' { out.push(n as u8); }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parses_multi_line_soa_and_quoted_semicolons() {
+        let zone_text = r#"$ORIGIN example.com.
+$TTL 3600
+@   IN  SOA   ns1.example.com. admin.example.com. (
+                2024010101  ; serial
+                3600        ; refresh
+                900         ; retry
+                604800      ; expire
+                300 )       ; minimum
+_dmarc      IN  TXT   "v=DMARC1; p=reject" ; trailing comment
+www         IN  A     203.0.113.10
+            300 IN  AAAA  2001:db8::1
+_http._tcp  IN  SRV   10 0 80 www.example.com.
+"#;
+        let path = std::env::temp_dir().join(format!("ironbind-test-{}.zone", std::process::id()));
+        std::fs::write(&path, zone_text).unwrap();
+        let mut zone = Zone::new("example.com");
+        zone.load_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let soa = zone.soa().expect("multi-line SOA should load");
+        assert_eq!(crate::cache::soa_minimum_ttl(&soa[0].rdata), 300);
+
+        let txt = zone.lookup("_dmarc.example.com", &RType::TXT).unwrap();
+        assert_eq!(&txt[0].rdata[1..], b"v=DMARC1; p=reject");
+
+        // A line starting with whitespace belongs to the previous owner, even with a leading TTL
+        let aaaa = zone.lookup("www.example.com", &RType::AAAA).unwrap();
+        assert_eq!(aaaa[0].ttl, 300);
+
+        // Empty non-terminal exists (NODATA, not NXDOMAIN)
+        assert!(zone.name_exists("_tcp.example.com"));
+        assert!(!zone.name_exists("missing.example.com"));
+    }
 }

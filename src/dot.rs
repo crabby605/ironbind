@@ -31,6 +31,10 @@ pub fn run(bind: String, cert_path: String, key_path: String, state: Arc<State>,
         let state = Arc::clone(&state);
         let peer_ip = stream.peer_addr().map(|a| a.ip())
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        // Without timeouts an idle or slow client holds a pool worker forever
+        let timeout = Some(std::time::Duration::from_millis(state.config.tcp_timeout_ms));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
         pool.submit(move || {
             let conn = match ServerConnection::new(tls_cfg) {
                 Ok(c) => c,

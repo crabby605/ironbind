@@ -24,6 +24,9 @@ pub struct ZoneDelta {
     pub added:       Vec<Record>,
 }
 
+/// Directory holding the DNSSEC keys written by setup.sh
+const KEY_DIRECTORY: &str = "keys";
+
 /// Manages zones with support for hot-reloading and signing
 pub struct ZoneManager {
     /// Current active zones: origin → Zone
@@ -55,6 +58,14 @@ impl ZoneManager {
     pub fn load_zone(&mut self, origin: &str, path: &str) -> std::io::Result<()> {
         let mut z = Zone::new(origin);
         z.load_file(path)?;
+
+        // Sign the zone when a ZSK for it exists in the key directory
+        let zsk_path = format!("{}/K{}+008+zsk.private", KEY_DIRECTORY, z.origin);
+        if std::path::Path::new(&zsk_path).exists() {
+            if let Err(e) = Self::sign_zone(&mut z, KEY_DIRECTORY) {
+                eprintln!("[zone-manager] failed to sign {}: {}", z.origin, e);
+            }
+        }
         let new_zone = Arc::new(z);
 
         // If a previous version exists, compute the diff and append to history.
@@ -152,31 +163,67 @@ impl ZoneManager {
     }
 
     /// Sign all RRsets in a zone with DNSSEC, producing RRSIG records.
-    /// Reads the ZSK from `<key_dir>/K<origin>+008+zsk.private`.
-    pub fn sign_zone(&self, origin: &str, key_dir: &str) -> std::io::Result<usize> {
-        use crate::zone_signing::{DnsKey, ZoneSigner, compute_key_tag};
+    /// Reads the ZSK from `<key_dir>/K<origin>+008+zsk.private` and, when present,
+    /// the KSK from `<key_dir>/K<origin>+008+ksk.private`. The DNSKEY records and
+    /// every RRSIG are added to the zone before it is published.
+    pub fn sign_zone(zone: &mut Zone, key_dir: &str) -> std::io::Result<usize> {
+        use crate::zone_signing::{DnsKey, ZoneSigner};
+
+        let origin = zone.origin.clone();
+        if zone.lookup(&origin, &RType::DNSKEY).is_some() {
+            eprintln!("[zone-manager] {} already carries DNSKEY records, leaving it unsigned", origin);
+            return Ok(0);
+        }
 
         let zsk_path = format!("{}/K{}+008+zsk.private", key_dir, origin);
         let mut zsk = DnsKey::from_pem_file(&zsk_path)?;
-        zsk.key_name = origin.to_string();
+        zsk.key_name = origin.clone();
 
-        let key_tag = compute_key_tag(&zsk.private_key);
-        let signer = ZoneSigner::new(zsk, None);
+        let ksk_path = format!("{}/K{}+008+ksk.private", key_dir, origin);
+        let ksk = match DnsKey::from_pem_file(&ksk_path) {
+            Ok(mut key) => {
+                key.key_name = origin.clone();
+                key.flags = 257; // zone key + secure entry point
+                Some(key)
+            }
+            Err(_) => None,
+        };
 
-        let zone = self.get_zone(origin).ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("zone {} not loaded", origin),
-        ))?;
+        let zsk_tag = zsk.key_tag()?;
+        let dnskey_ttl = zone.soa().and_then(|soa| soa.first()).map(|soa| soa.ttl).unwrap_or(3600);
+        zone.add(zsk.dnskey_record(dnskey_ttl)?);
+        let ksk_tag = match &ksk {
+            Some(key) => {
+                zone.add(key.dnskey_record(dnskey_ttl)?);
+                Some(key.key_tag()?)
+            }
+            None => None,
+        };
 
-        let mut rrsigs = 0;
-        for rrset in zone.iter_rrsets() {
-            if signer.sign_rrset(rrset, origin, key_tag).is_ok() {
-                rrsigs += 1;
+        let signer = ZoneSigner::new(zsk, ksk);
+        let rrsets: Vec<Vec<Record>> = zone.iter_rrsets().cloned().collect();
+
+        let mut rrsigs = Vec::new();
+        for rrset in &rrsets {
+            match signer.sign_rrset(rrset, &origin, zsk_tag) {
+                Ok(rrsig) => rrsigs.push(rrsig),
+                Err(e) => eprintln!("[zone-manager] failed to sign {} {:?}: {}", rrset[0].name, rrset[0].rtype, e),
+            }
+            // The DNSKEY RRset is also signed by the KSK so resolvers can anchor it via DS
+            if rrset[0].rtype == RType::DNSKEY {
+                if let (Some(key), Some(tag)) = (signer.ksk(), ksk_tag) {
+                    rrsigs.push(signer.sign_rrset_with_key(key, rrset, &origin, tag)?);
+                }
             }
         }
 
-        eprintln!("[zone-manager] signed {} RRsets in {}", rrsigs, origin);
-        Ok(rrsigs)
+        let count = rrsigs.len();
+        for rrsig in rrsigs {
+            zone.add(rrsig);
+        }
+
+        eprintln!("[zone-manager] signed {} RRsets in {}", count, origin);
+        Ok(count)
     }
 }
 

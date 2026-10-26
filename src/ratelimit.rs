@@ -61,7 +61,11 @@ impl RateLimiter {
         if now.duration_since(*last).as_secs() < 60 { return; }
         *last = now;
         drop(last);
-        // Remove buckets that are full (idle IPs)
-        map.retain(|_, b| b.tokens < self.capacity);
+        // Remove buckets that would be full by now (idle IPs). Tokens only refill
+        // on access, so the elapsed time has to be counted here as well.
+        map.retain(|_, b| {
+            let idle_seconds = now.duration_since(b.last_refill).as_secs_f64();
+            b.tokens + idle_seconds * self.rate < self.capacity
+        });
     }
 }

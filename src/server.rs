@@ -179,8 +179,10 @@ pub fn run(state: Arc<State>) {
                     st.metrics.record_udp_query();
                     let resp = handle_query_public(&data, &st, peer.ip());
                     if let Some(r) = resp {
-                        // UDP max — truncate if over limit
-                        let max = if st.config.dnssec_validate { 4096 } else { 512 };
+                        // UDP max is the client's EDNS payload size, or 512 without EDNS (RFC 6891 §6.2.5)
+                        let max = Parser::new(&data).parse()
+                            .map(|query| (query.edns_udp_size as usize).clamp(512, 4096))
+                            .unwrap_or(512);
                         let r = if r.len() > max {
                             build_truncated(&data)
                         } else {
@@ -262,36 +264,64 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     resp.dnssec_ok = pkt.dnssec_ok;
 
     // ── 1. Authoritative zone lookup ─────────────────────────────────────────
+    // The most specific zone wins, so a child zone is not shadowed by its parent.
     let zones_snapshot: Vec<Arc<Zone>> = state.zones.read().unwrap().clone();
-    for zone in &zones_snapshot {
-        if !zone.is_authoritative_for(&q.name) { continue; }
-
+    let authoritative_zone = zones_snapshot.iter()
+        .filter(|zone| zone.is_authoritative_for(&q.name))
+        .max_by_key(|zone| zone.origin.len());
+    if let Some(zone) = authoritative_zone {
         resp.set_aa();
 
-        if let Some(records) = zone.lookup(&q.name, &q.qtype) {
-            resp.answers = records.clone();
-            // Add DNSSEC records if DO bit set
-            if pkt.dnssec_ok {
-                if let Some(rrsigs) = zone.lookup(&q.name, &RType::RRSIG) {
-                    resp.answers.extend(rrsigs.iter()
-                        .filter(|r| {
-                            if let Ok(sig) = crate::proto::parse_rrsig(&r.rdata) {
-                                sig.type_covered == u16::from(&q.qtype)
-                            } else { false }
-                        })
-                        .cloned());
+        // Follow CNAMEs inside the zone (RFC 1034 §4.3.2). A target outside the
+        // zone is returned as-is for the client's resolver to chase.
+        let mut current_name = q.name.clone();
+        let mut answered = false;
+        for _ in 0..MAX_CNAME_CHAIN {
+            if let Some(records) = zone.lookup(&current_name, &q.qtype) {
+                resp.answers.extend(records.iter().cloned());
+                if pkt.dnssec_ok {
+                    resp.answers.extend(covering_rrsigs(zone, &current_name, &q.qtype));
                 }
+                answered = true;
+                break;
             }
+            if q.qtype == RType::CNAME { break; }
+            let Some(cname) = zone.lookup(&current_name, &RType::CNAME).and_then(|c| c.first()) else { break };
+            resp.answers.push(cname.clone());
+            if pkt.dnssec_ok {
+                resp.answers.extend(covering_rrsigs(zone, &current_name, &RType::CNAME));
+            }
+            let Ok(target) = Parser::new(&cname.rdata).name() else { break };
+            if !zone.is_authoritative_for(&target) {
+                answered = true;
+                break;
+            }
+            current_name = target;
+        }
+
+        if answered {
             state.metrics.record_success();
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
             return Some(serialize(&resp, resp.edns_udp_size > 0));
         }
 
+        // Add SOA to authority for both negative answers (RFC 2308 §3)
+        if let Some(soa) = zone.soa() {
+            resp.authority = soa.clone();
+            if pkt.dnssec_ok {
+                resp.authority.extend(covering_rrsigs(zone, &zone.origin, &RType::SOA));
+            }
+        }
+
         // Name exists but type doesn't → NODATA
-        if zone.name_exists(&q.name) {
-            // Add SOA to authority
-            if let Some(soa) = zone.soa() {
-                resp.authority = soa.clone();
+        if zone.name_exists(&current_name) {
+            // RFC 4035 §3.1.3.1: the NSEC at the name proves the type is absent
+            if pkt.dnssec_ok {
+                if let Some(next) = zone.nsec_next(&current_name) {
+                    if let Some(nsec) = zone.nsec_record(&current_name, &next) {
+                        resp.authority.push(nsec);
+                    }
+                }
             }
             state.metrics.record_success();
             state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
@@ -300,16 +330,13 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
 
         // NXDOMAIN
         resp.set_rcode(RCODE_NXDOMAIN);
-        if let Some(soa) = zone.soa() {
-            resp.authority = soa.clone();
-        }
         // RFC 4035 §3.1.3 / RFC 5155 §7.2.2: include NSEC or NSEC3 proving
         // non-existence when the DO bit is set. Prefer NSEC3 if the zone is
         // configured for opt-out denial.
         if pkt.dnssec_ok {
-            if let Some(nsec3) = zone.nsec3_covering(&q.name) {
+            if let Some(nsec3) = zone.nsec3_covering(&current_name) {
                 resp.authority.push(nsec3);
-            } else if let Some((prev, next)) = zone.nsec_covering(&q.name) {
+            } else if let Some((prev, next)) = zone.nsec_covering(&current_name) {
                 if let Some(nsec) = zone.nsec_record(&prev, &next) {
                     resp.authority.push(nsec);
                 }
@@ -452,6 +479,22 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     }
     state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
     Some(serialize(&resp, resp.edns_udp_size > 0))
+}
+
+/// Longest CNAME chain followed inside an authoritative zone before giving up.
+const MAX_CNAME_CHAIN: usize = 8;
+
+/// RRSIGs stored at `name` that cover `covered_type`.
+fn covering_rrsigs(zone: &Zone, name: &str, covered_type: &RType) -> Vec<Record> {
+    let covered_type_code = u16::from(covered_type);
+    zone.lookup(name, &RType::RRSIG)
+        .map(|rrsigs| rrsigs.iter()
+            .filter(|r| crate::proto::parse_rrsig(&r.rdata)
+                .map(|sig| sig.type_covered == covered_type_code)
+                .unwrap_or(false))
+            .cloned()
+            .collect())
+        .unwrap_or_default()
 }
 
 // ── TCP handler (RFC 1035 §4.2.2 — 2-byte length prefix) ─────────────────────

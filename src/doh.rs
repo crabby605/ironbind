@@ -32,6 +32,10 @@ pub fn run(bind: String, cert_path: String, key_path: String, state: Arc<State>,
         let state = Arc::clone(&state);
         let peer_ip = stream.peer_addr().map(|a| a.ip())
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        // Without timeouts an idle or slow client holds a pool worker forever
+        let timeout = Some(std::time::Duration::from_millis(state.config.tcp_timeout_ms));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
         pool.submit(move || {
             let conn = match ServerConnection::new(tls_cfg) {
                 Ok(c) => c,
@@ -83,6 +87,10 @@ fn handle_http<S: Read + Write>(s: &mut S, state: &State, peer_ip: IpAddr) {
         "POST" if target.starts_with("/dns-query") => {
             if content_type != "application/dns-message" {
                 write_status(s, 415, "Unsupported Media Type"); return;
+            }
+            // A DNS message never exceeds 65535 bytes; refuse larger bodies up front
+            if content_length > u16::MAX as usize {
+                write_status(s, 413, "Payload Too Large"); return;
             }
             let body_start = header_end + 4;
             let already = total.saturating_sub(body_start);

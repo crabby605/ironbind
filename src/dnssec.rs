@@ -241,7 +241,7 @@ impl Validator {
 
 // ── Signed data construction (RFC 4034 §6.2) ────────────────────────────────
 
-fn build_signed_data(rrsig: &crate::proto::Rrsig, rrset: &[Record]) -> Vec<u8> {
+pub(crate) fn build_signed_data(rrsig: &crate::proto::Rrsig, rrset: &[Record]) -> Vec<u8> {
     let mut data = Vec::new();
 
     // RRSIG RDATA (without signature field)
