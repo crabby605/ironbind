@@ -2,6 +2,8 @@
 
 A BIND-shaped authoritative + recursive DNS server, written from scratch in Rust.
 
+![ironbind serving a zone file, NXDOMAIN with NSEC, cached recursion compared with Quad9, Google and Cloudflare, DNS-over-HTTPS, and Prometheus metrics](demo.gif)
+
 ## What it does
 
 - **Authoritative serving** for zones loaded from RFC 1035 zone files (A, AAAA, CNAME, MX, NS, SOA, TXT, PTR, SRV, NAPTR, DNSKEY, DS, RRSIG, NSEC, NSEC3, NSEC3PARAM)
@@ -9,7 +11,7 @@ A BIND-shaped authoritative + recursive DNS server, written from scratch in Rust
 - **DNSSEC validation** with real crypto — RSA-SHA256/512, ECDSA P-256/P-384, Ed25519 (uses the `rsa`, `p256`, `p384`, `ed25519-dalek` crates)
 - **Full chain of trust** anchored at the pinned IANA root KSKs (KSK-2017, KSK-2024) when `dnssec_strict = true`
 - **Denial of existence** — emits NSEC or NSEC3 (RFC 5155) on authoritative NXDOMAIN
-- **Zone signing** producing RRSIG records
+- **Zone signing** at load time: when `keys/K<zone>+008+zsk.private` exists the zone is signed with RSA-SHA256, DNSKEY records are published, and the KSK signs the DNSKEY RRset
 - **AXFR + IXFR** over TCP (RFC 5936, RFC 1995) with on-disk delta history for true incremental transfers
 - **TSIG (HMAC-SHA256)** signing and verification on transfers and (optionally) every query (RFC 8945)
 - **DNS-over-TLS** (RFC 7858) and **DNS-over-HTTPS** (RFC 8484) via `rustls`
@@ -17,7 +19,8 @@ A BIND-shaped authoritative + recursive DNS server, written from scratch in Rust
 - **Rate limiting** per source IP
 - **Prometheus `/metrics`** endpoint with query, cache, RCODE, DNSSEC, and latency counters
 - **SIGHUP hot reload** — `kill -HUP` swaps in new zones atomically without dropping queries
-- **Bounded worker thread pool** — query floods queue instead of spawning unbounded threads
+- **Bounded worker pools** — floods are shed instead of queued without limit; TCP/DoT/DoH run on their own pool so idle connections can't starve UDP
+- **Self-healing** — a panicking query is contained to its worker, and every listener restarts itself with backoff if it dies or fails to bind
 - **IPv4 + IPv6** binds (v6 literals auto-bracketed)
 
 ## Quick start
@@ -31,11 +34,12 @@ cargo build --release
 In another terminal:
 
 ```bash
-dig @127.0.0.1 -p 5353 example.com A
-dig @127.0.0.1 -p 5353 example.com MX
-dig @127.0.0.1 -p 5353 example.com TXT
-dig @127.0.0.1 -p 5353 +tcp api.example.com         # follows CNAME
-dig @127.0.0.1 -p 5353 nonexistent.example.com      # NXDOMAIN with NSEC
+dig @127.0.0.1 -p 5000 example.com A
+dig @127.0.0.1 -p 5000 example.com MX
+dig @127.0.0.1 -p 5000 example.com TXT
+dig @127.0.0.1 -p 5000 +tcp api.example.com         # follows CNAME
+dig @127.0.0.1 -p 5000 +dnssec www.example.com      # answer + RRSIG
+dig @127.0.0.1 -p 5000 +dnssec nonexistent.example.com   # NXDOMAIN with NSEC
 ```
 
 Metrics:
@@ -73,12 +77,13 @@ Full annotated `config.toml`:
 ```toml
 [server]
 bind             = "0.0.0.0"     # or "::" for IPv6, or any literal
-port             = 5353
+port             = 5000          # 5353 clashes with mDNSResponder on macOS
 worker_threads   = 64
 use_forwarders   = true          # try /etc/resolv.conf before iterative
 dnssec_validate  = true          # validate RRSIGs on recursive answers
 dnssec_strict    = false         # if true, walk full chain from IANA anchors
-tcp_timeout_ms   = 5000
+tcp_timeout_ms   = 5000          # also applies to DoT/DoH connections
+log_queries      = false         # log every query to stderr (megabytes per second under load)
 
 [zones]
 files = ["example.com.zone"]
@@ -120,7 +125,15 @@ Omit any section to disable that feature. With no `[zones]`, ironbind serves a b
 
 ### Authoritative queries
 
-Drop a zone file like `example.com.zone` (see the one in this repo) and reference it in `[zones].files`. Standard RFC 1035 syntax: `$ORIGIN`, `$TTL`, all record types listed above.
+Drop a zone file like `example.com.zone` (see the one in this repo) and reference it in `[zones].files`. Standard RFC 1035 syntax: `$ORIGIN`, `$TTL`, multi-line records in parentheses, quoted TXT strings, and the record types listed above. CNAMEs inside the zone are followed in the answer.
+
+### DNSSEC signing
+
+Run `./setup.sh` (or drop your own RSA keys at `keys/K<zone>+008+zsk.private` and `keys/K<zone>+008+ksk.private`) and the zone is signed every time it loads, including on SIGHUP. Fetch the KSK to build a DS record for the parent (`dnssec-dsfromkey` ships with BIND's tools):
+
+```bash
+dig @127.0.0.1 -p 5000 example.com DNSKEY | dnssec-dsfromkey -f - example.com
+```
 
 ### Recursive resolution
 
@@ -148,8 +161,8 @@ curl -sk "https://127.0.0.1:8443/dns-query?dns=$(base64 -i query.bin | tr '+/' '
 With a TSIG key configured, transfers must be signed:
 
 ```bash
-dig @127.0.0.1 -p 5353 -y hmac-sha256:transfer-key.:$SECRET example.com AXFR
-dig @127.0.0.1 -p 5353 -y hmac-sha256:transfer-key.:$SECRET \
+dig @127.0.0.1 -p 5000 -y hmac-sha256:transfer-key.:$SECRET example.com AXFR
+dig @127.0.0.1 -p 5000 -y hmac-sha256:transfer-key.:$SECRET \
     example.com IXFR=2024010101
 ```
 
@@ -180,6 +193,20 @@ ironbind_dnssec_valid            SECURE validations
 ironbind_dnssec_bogus            BOGUS validations
 ironbind_query_time_ms           avg latency
 ```
+
+## Resilience
+
+Load-tested on loopback (Apple M4, 10 cores) with a Python client, which is the bottleneck for the per-query numbers:
+
+| Scenario | Result |
+|----------|--------|
+| Mixed authoritative queries, UDP | ~95k qps, 100% answered, 0 wrong |
+| Pipelined TCP | ~150k qps, 100% answered, 0 wrong |
+| UDP flood at 250k–466k packets/s | excess dropped, memory flat at ~17 MB, answers again immediately after |
+| 4M fuzzed / malformed packets | no crashes |
+| 200 idle TCP connections | UDP latency unchanged (0.1 ms) |
+
+In-process recovery covers panics and failed binds. For crashes nothing in-process can catch (OOM kill, `SIGKILL`), run it under a supervisor: `Restart=always` in a systemd unit, or `KeepAlive` in a launchd plist.
 
 ## Testing
 

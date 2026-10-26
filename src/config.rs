@@ -144,6 +144,9 @@ pub struct ServerConfig {
     pub neg_cache_ttl:   u32,
     pub zone_files:      Vec<String>,
     pub log_level:       String,
+    /// Log every query (and per-query errors) to stderr. Off by default: at
+    /// load this writes megabytes per second.
+    pub log_queries:     bool,
     pub tcp_timeout_ms:  u64,
     pub rate_limit:      Option<RateLimitConfig>,
     /// HTTP port for Prometheus metrics scraping. 0 = disabled.
@@ -257,6 +260,7 @@ impl Default for ServerConfig {
             neg_cache_ttl:   300,
             zone_files:      vec![],
             log_level:       "info".to_string(),
+            log_queries:     false,
             tcp_timeout_ms:  5000,
             rate_limit:      None,
             metrics_port:    0,
@@ -282,6 +286,7 @@ impl ServerConfig {
         if let Some(v) = t.int(Some("cache"),  "max_entries") { c.cache_max = v as usize; }
         if let Some(v) = t.int(Some("cache"),  "neg_ttl")     { c.neg_cache_ttl = v as u32; }
         if let Some(v) = t.str(Some("server"), "log_level")   { c.log_level = v.to_string(); }
+        if let Some(v) = t.bool(Some("server"), "log_queries") { c.log_queries = v; }
         if let Some(v) = t.int(Some("server"), "tcp_timeout_ms") { c.tcp_timeout_ms = v as u64; }
         if let Some(v) = t.int(Some("server"), "worker_threads") { c.worker_threads = v as usize; }
         if let Some(v) = t.int(Some("metrics"), "port") { c.metrics_port = v as u16; }

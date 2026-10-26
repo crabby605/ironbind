@@ -58,6 +58,8 @@ pub struct ResolverConfig {
     pub use_forwarders: bool,
     /// UDP query timeout in milliseconds (default: 2000ms)
     pub timeout_ms: u64,
+    /// Log each recursive step (mirrors `log_queries` in config.toml)
+    pub log_queries: bool,
 }
 
 impl ResolverConfig {
@@ -68,6 +70,7 @@ impl ResolverConfig {
             use_forwarders: !forwarders.is_empty(),
             forwarders,
             timeout_ms: TIMEOUT_MS,
+            log_queries: false,
         }
     }
 }
@@ -143,7 +146,7 @@ impl Resolver {
                 }
             }
             // forwarders all failed — fall through to iterative
-            eprintln!("[resolver] all forwarders failed, falling back to iterative");
+            if self.config.log_queries { eprintln!("[resolver] all forwarders failed, falling back to iterative"); }
         }
 
         // 2. Iterative resolution from root
@@ -184,7 +187,7 @@ impl Resolver {
                         break 'ns_loop;
                     }
                     Err(e) => {
-                        eprintln!("[iter] {} → {}: {}", current_name, addr, e);
+                        if self.config.log_queries { eprintln!("[iter] {} → {}: {}", current_name, addr, e); }
                         continue;
                     }
                 }
@@ -212,7 +215,7 @@ impl Resolver {
                         if target.is_empty() || cname_chain.contains(&target) {
                             return ResolveResult::ServFail("CNAME loop".to_string());
                         }
-                        eprintln!("[iter] CNAME {} → {}", current_name, target);
+                        if self.config.log_queries { eprintln!("[iter] CNAME {} → {}", current_name, target); }
                         cname_chain.push(current_name.clone());
                         current_name = target;
                         // Restart from root for CNAME target
@@ -284,7 +287,7 @@ impl Resolver {
                     ));
                 }
 
-                eprintln!("[iter] referral for {} → {:?}", current_name, &ns_names[..1]);
+                if self.config.log_queries { eprintln!("[iter] referral for {} → {:?}", current_name, &ns_names[..1]); }
                 nameservers = next_ns;
                 referral_count += 1;
                 continue;

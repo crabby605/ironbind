@@ -66,7 +66,7 @@ impl Cache {
     /// Case-insensitive: WWW.EXAMPLE.COM finds entry for www.example.com
     pub fn get(&self, name: &str, qtype: &RType) -> Option<CacheValue> {
         let key = CacheKey { name: name.to_ascii_lowercase(), qtype: u16::from(qtype) };
-        let map = self.inner.read().unwrap();
+        let map = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         match map.get(&key) {
             Some(e) if e.expires > Instant::now() => Some(e.value.clone()),
             _ => None,
@@ -78,7 +78,7 @@ impl Cache {
     pub fn insert_positive(&self, name: &str, qtype: &RType, records: Vec<Record>, ttl: u32) {
         let ttl = ttl.clamp(1, 86400);  // Sanity check: 1s to 24h
         let key = CacheKey { name: name.to_ascii_lowercase(), qtype: u16::from(qtype) };
-        self.inner.write().unwrap().insert(key, Entry {
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, Entry {
             value:   CacheValue::Records(records),
             expires: Instant::now() + Duration::from_secs(ttl as u64),
             ttl,
@@ -91,7 +91,7 @@ impl Cache {
     pub fn insert_negative(&self, name: &str, qtype: &RType, kind: NegativeKind, soa_ttl: u32) {
         let ttl = soa_ttl.min(10800).max(1);  // Clamp to [1s, 3h]
         let key = CacheKey { name: name.to_ascii_lowercase(), qtype: u16::from(qtype) };
-        self.inner.write().unwrap().insert(key, Entry {
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, Entry {
             value:   CacheValue::Negative(kind),
             expires: Instant::now() + Duration::from_secs(ttl as u64),
             ttl,
@@ -102,12 +102,12 @@ impl Cache {
     /// Removes all entries past their expiration time (garbage collection)
     pub fn evict_expired(&self) {
         let now = Instant::now();
-        self.inner.write().unwrap().retain(|_, v| v.expires > now);
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, v| v.expires > now);
     }
 
     /// Current number of cached entries (useful for monitoring)
     pub fn size(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 }
 

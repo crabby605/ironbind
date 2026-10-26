@@ -86,11 +86,12 @@ echo "→ Writing config.toml"
 cat > config.toml <<EOF
 [server]
 bind            = "0.0.0.0"
-port            = 5353
+port            = 5000
 worker_threads  = 64
 dnssec_validate = true
 dnssec_strict   = false
 tcp_timeout_ms  = 5000
+log_queries     = false
 
 [zones]
 files = ["example.com.zone"]

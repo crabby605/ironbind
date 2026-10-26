@@ -37,6 +37,7 @@ use crate::{
     zone::Zone,
     zone_manager::ZoneManager,
 };
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::RwLock;
 use std::time::Instant;
 
@@ -93,7 +94,7 @@ pub fn run(state: Arc<State>) {
     // Cache eviction thread
     {
         let cache = Arc::clone(&state.cache);
-        thread::spawn(move || loop {
+        spawn_supervised("cache-eviction", move || loop {
             thread::sleep(Duration::from_secs(60));
             cache.evict_expired();
         });
@@ -102,15 +103,15 @@ pub fn run(state: Arc<State>) {
     // SIGHUP reload watcher: polls the flag set by the signal handler
     {
         let state = Arc::clone(&state);
-        thread::spawn(move || loop {
+        spawn_supervised("reload-watcher", move || loop {
             thread::sleep(Duration::from_secs(1));
             if signals::should_reload() {
                 eprintln!("[signals] SIGHUP received, reloading zones");
-                let mut mgr = state.zone_manager.write().unwrap();
+                let mut mgr = state.zone_manager.write().unwrap_or_else(std::sync::PoisonError::into_inner);
                 mgr.reload_all();
                 let reloaded: Vec<Arc<Zone>> = mgr.get_zones();
                 if !reloaded.is_empty() {
-                    *state.zones.write().unwrap() = reloaded;
+                    *state.zones.write().unwrap_or_else(std::sync::PoisonError::into_inner) = reloaded;
                 }
             }
         });
@@ -120,42 +121,48 @@ pub fn run(state: Arc<State>) {
     if state.config.metrics_port > 0 {
         let metrics = Arc::clone(&state.metrics);
         let port = state.config.metrics_port;
-        thread::spawn(move || metrics_server(port, metrics));
+        spawn_supervised("metrics", move || metrics_server(port, Arc::clone(&metrics)));
     }
 
-    // Bounded worker pool — all UDP/TCP/DoT/DoH queries dispatch here.
-    let pool = Arc::new(ThreadPool::new(state.config.worker_threads.max(1)));
+    // Bounded worker pools. Connections (TCP/DoT/DoH) get their own pool so idle
+    // or slow clients can't hold the workers that answer UDP.
+    let workers = state.config.worker_threads.max(1);
+    let pool = Arc::new(ThreadPool::new("udp", workers, workers * UDP_QUEUE_PER_WORKER));
+    let connection_pool = Arc::new(ThreadPool::new("conn", workers, workers));
 
     // Optional DoT/DoH listeners
     if let Some(dot) = &state.config.dot {
         let state = Arc::clone(&state);
-        let pool = Arc::clone(&pool);
+        let pool = Arc::clone(&connection_pool);
         let bind = dot.bind.clone();
         let cert = dot.cert_path.clone();
         let key = dot.key_path.clone();
-        thread::spawn(move || crate::dot::run(bind, cert, key, state, pool));
+        spawn_supervised("dot", move || crate::dot::run(
+            bind.clone(), cert.clone(), key.clone(), Arc::clone(&state), Arc::clone(&pool)));
     }
     if let Some(doh) = &state.config.doh {
         let state = Arc::clone(&state);
-        let pool = Arc::clone(&pool);
+        let pool = Arc::clone(&connection_pool);
         let bind = doh.bind.clone();
         let cert = doh.cert_path.clone();
         let key = doh.key_path.clone();
-        thread::spawn(move || crate::doh::run(bind, cert, key, state, pool));
+        spawn_supervised("doh", move || crate::doh::run(
+            bind.clone(), cert.clone(), key.clone(), Arc::clone(&state), Arc::clone(&pool)));
     }
 
     // TCP listener thread
     {
         let state = Arc::clone(&state);
         let addr  = addr.clone();
-        let pool  = Arc::clone(&pool);
-        thread::spawn(move || {
+        let pool  = Arc::clone(&connection_pool);
+        spawn_supervised("tcp", move || {
             let listener = TcpListener::bind(&addr).expect("TCP bind failed");
             eprintln!("[tcp] listening on {}", addr);
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
                         let st = Arc::clone(&state);
+                        // Every worker busy: the connection is closed instead of queued
                         pool.submit(move || handle_tcp(s, st));
                     }
                     Err(e) => eprintln!("[tcp] accept: {}", e),
@@ -165,16 +172,23 @@ pub fn run(state: Arc<State>) {
     }
 
     // UDP main loop
-    let sock = UdpSocket::bind(&addr).expect("UDP bind failed");
+    // UDP main loop, restarted in place if it ever panics
+    run_supervised("udp", || udp_loop(&addr, &state, &pool));
+}
+
+fn udp_loop(addr: &str, state: &Arc<State>, pool: &Arc<ThreadPool>) {
+    // One socket shared by every worker; cloning it per packet runs out of file descriptors under load
+    let sock = Arc::new(UdpSocket::bind(addr).expect("UDP bind failed"));
     eprintln!("[udp] listening on {}", addr);
 
+    let mut buf = vec![0u8; 4096];
     loop {
-        let mut buf = vec![0u8; 4096];
         match sock.recv_from(&mut buf) {
             Ok((len, peer)) => {
                 let data = buf[..len].to_vec();
-                let st   = Arc::clone(&state);
-                let sock = sock.try_clone().expect("socket clone");
+                let st   = Arc::clone(state);
+                let sock = Arc::clone(&sock);
+                // Queue full: drop the packet, the client retries (same as a full socket buffer)
                 pool.submit(move || {
                     st.metrics.record_udp_query();
                     let resp = handle_query_public(&data, &st, peer.ip());
@@ -195,6 +209,30 @@ pub fn run(state: Arc<State>) {
             Err(e) => eprintln!("[udp] recv: {}", e),
         }
     }
+}
+
+// ── Supervision ───────────────────────────────────────────────────────────────
+//
+// Every long-running loop runs under a supervisor: if it panics or returns
+// (a bind failed, a listener died) it is started again after a backoff of
+// 1s doubling to 30s, reset once the loop has stayed up for a minute.
+
+fn run_supervised<F: Fn()>(name: &str, job: F) {
+    let mut delay = Duration::from_secs(1);
+    loop {
+        let started = Instant::now();
+        match panic::catch_unwind(AssertUnwindSafe(&job)) {
+            Ok(())  => eprintln!("[supervisor] {} stopped, restarting in {:?}", name, delay),
+            Err(_)  => eprintln!("[supervisor] {} panicked, restarting in {:?}", name, delay),
+        }
+        if started.elapsed() > Duration::from_secs(60) { delay = Duration::from_secs(1); }
+        thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_secs(30));
+    }
+}
+
+fn spawn_supervised<F: Fn() + Send + 'static>(name: &'static str, job: F) {
+    thread::spawn(move || run_supervised(name, job));
 }
 
 // ── Query handler ─────────────────────────────────────────────────────────────
@@ -218,7 +256,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     // Rate limit check
     if let Some(rl) = &state.rate_limiter {
         if !rl.check(peer_ip) {
-            eprintln!("[ratelimit] dropped query from {}", peer_ip);
+            if state.config.log_queries { eprintln!("[ratelimit] dropped query from {}", peer_ip); }
             return None; // drop silently (RFC 5358 recommendation)
         }
     }
@@ -227,7 +265,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     // mandatory check in maybe_zone_transfer.
     if state.config.tsig_require_all && !state.tsig_keys.is_empty() {
         if let Err(e) = verify_message(data, &state.tsig_keys) {
-            eprintln!("[tsig] rejecting query from {}: {}", peer_ip, e);
+            if state.config.log_queries { eprintln!("[tsig] rejecting query from {}: {}", peer_ip, e); }
             let id = if data.len() >= 2 { u16::from_be_bytes([data[0], data[1]]) } else { 0 };
             let mut r = Packet::new_response(id, 0);
             r.set_rcode(RCODE_REFUSED);
@@ -238,7 +276,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     let pkt = match Parser::new(data).parse() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[parse] {} {}", peer_ip, e);
+            if state.config.log_queries { eprintln!("[parse] {} {}", peer_ip, e); }
             return Some(formerr_response(data));
         }
     };
@@ -255,7 +293,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
         None    => return Some(error_response(&pkt, RCODE_NOERROR)),
     };
 
-    log_query(&q, &peer_ip);
+    if state.config.log_queries { log_query(&q, &peer_ip); }
 
     // Build response
     let mut resp = Packet::new_response(pkt.id, pkt.flags);
@@ -265,7 +303,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
 
     // ── 1. Authoritative zone lookup ─────────────────────────────────────────
     // The most specific zone wins, so a child zone is not shadowed by its parent.
-    let zones_snapshot: Vec<Arc<Zone>> = state.zones.read().unwrap().clone();
+    let zones_snapshot: Vec<Arc<Zone>> = state.zones.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let authoritative_zone = zones_snapshot.iter()
         .filter(|zone| zone.is_authoritative_for(&q.name))
         .max_by_key(|zone| zone.origin.len());
@@ -412,7 +450,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
 
                     match result {
                         ValidationResult::Bogus(reason) => {
-                            eprintln!("[dnssec] BOGUS for {}: {}", q.name, reason);
+                            if state.config.log_queries { eprintln!("[dnssec] BOGUS for {}: {}", q.name, reason); }
                             state.metrics.record_dnssec_bogus();
                             state.metrics.record_servfail();
                             resp.set_rcode(RCODE_SERVFAIL);
@@ -420,7 +458,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
                             return Some(serialize(&resp, resp.edns_udp_size > 0));
                         }
                         ValidationResult::Secure => {
-                            eprintln!("[dnssec] SECURE: {}", q.name);
+                            if state.config.log_queries { eprintln!("[dnssec] SECURE: {}", q.name); }
                             state.metrics.record_dnssec_valid();
                         }
                         _ => {}
@@ -468,7 +506,7 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
         }
 
         ResolveResult::ServFail(reason) => {
-            eprintln!("[servfail] {}: {}", q.name, reason);
+            if state.config.log_queries { eprintln!("[servfail] {}: {}", q.name, reason); }
             state.metrics.record_servfail();
             resp.set_rcode(RCODE_SERVFAIL);
         }
@@ -480,6 +518,9 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr) -> Option<Vec<u8>> 
     state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
     Some(serialize(&resp, resp.edns_udp_size > 0))
 }
+
+/// Queued UDP queries allowed per worker before new packets are dropped.
+const UDP_QUEUE_PER_WORKER: usize = 64;
 
 /// Longest CNAME chain followed inside an authoritative zone before giving up.
 const MAX_CNAME_CHAIN: usize = 8;
@@ -581,7 +622,7 @@ fn maybe_zone_transfer(data: &[u8], state: &State) -> Option<Vec<Vec<u8>>> {
         }
     }
 
-    let zones = state.zones.read().unwrap().clone();
+    let zones = state.zones.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let zone = zones.iter().find(|z| z.is_authoritative_for(&q.name))?;
 
     let mut packets = if is_axfr {
@@ -596,7 +637,7 @@ fn maybe_zone_transfer(data: &[u8], state: &State) -> Option<Vec<Vec<u8>>> {
                 p.u32().ok()
             })
             .unwrap_or(0);
-        let history = state.zone_manager.read().unwrap()
+        let history = state.zone_manager.read().unwrap_or_else(std::sync::PoisonError::into_inner)
             .ixfr_chain(&q.name, requester_serial);
         axfr::ixfr_stream(&pkt, zone, requester_serial, history)
     };

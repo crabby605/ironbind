@@ -69,11 +69,11 @@ impl ZoneManager {
         let new_zone = Arc::new(z);
 
         // If a previous version exists, compute the diff and append to history.
-        let prev = self.zones.read().unwrap().get(origin).cloned();
+        let prev = self.zones.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(origin).cloned();
         if let Some(old) = prev {
             if let Some(delta) = build_delta(&old, &new_zone) {
                 if delta.from_serial != delta.to_serial {
-                    let mut hist = self.history.write().unwrap();
+                    let mut hist = self.history.write().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let queue = hist.entry(origin.to_string()).or_default();
                     queue.push_back(delta);
                     while queue.len() > self.history_cap { queue.pop_front(); }
@@ -85,12 +85,12 @@ impl ZoneManager {
         self.zone_files.insert(origin.to_string(), path.to_string());
 
         // Update version
-        let mut versions = self.versions.write().unwrap();
+        let mut versions = self.versions.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let version = versions.get(origin).unwrap_or(&0) + 1;
         versions.insert(origin.to_string(), version);
 
         // Store zone (atomically)
-        let mut zones = self.zones.write().unwrap();
+        let mut zones = self.zones.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         zones.insert(origin.to_string(), new_zone);
 
         eprintln!("[zone-manager] loaded {} (v{})", origin, version);
@@ -101,7 +101,7 @@ impl ZoneManager {
     /// current zone serial. Returns None if we can't reconstruct that history
     /// (caller should fall back to AXFR).
     pub fn ixfr_chain(&self, origin: &str, from_serial: u32) -> Option<Vec<ZoneDelta>> {
-        let hist = self.history.read().unwrap();
+        let hist = self.history.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let queue = hist.get(origin)?;
         // Find the earliest delta that starts at `from_serial`, then walk
         // forward through contiguous links.
@@ -144,19 +144,19 @@ impl ZoneManager {
 
     /// Get list of all zones (returns Arc for thread-safe sharing)
     pub fn get_zones(&self) -> Vec<Arc<Zone>> {
-        let zones = self.zones.read().unwrap();
+        let zones = self.zones.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         zones.values().cloned().collect()
     }
 
     /// Get a specific zone by origin
     pub fn get_zone(&self, origin: &str) -> Option<Arc<Zone>> {
-        let zones = self.zones.read().unwrap();
+        let zones = self.zones.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         zones.get(origin).cloned()
     }
 
     /// Get zone version for change tracking
     pub fn get_version(&self, origin: &str) -> u32 {
-        self.versions.read().unwrap()
+        self.versions.read().unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(origin)
             .copied()
             .unwrap_or(0)

@@ -34,7 +34,7 @@ impl RateLimiter {
     /// Returns true if the query is allowed, false if rate-limited
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut map = self.buckets.lock().unwrap();
+        let mut map = self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let bucket = map.entry(ip).or_insert(Bucket {
             tokens:     self.capacity,
@@ -57,7 +57,7 @@ impl RateLimiter {
     }
 
     fn maybe_prune(&self, map: &mut HashMap<IpAddr, Bucket>, now: Instant) {
-        let mut last = self.last_prune.lock().unwrap();
+        let mut last = self.last_prune.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if now.duration_since(*last).as_secs() < 60 { return; }
         *last = now;
         drop(last);

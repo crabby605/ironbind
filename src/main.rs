@@ -96,6 +96,7 @@ fn main() {
     // ── Resolver ─────────────────────────────────────────────────────────────
     let mut res_cfg = ResolverConfig::from_resolv_conf();
     res_cfg.use_forwarders = cfg.use_forwarders;
+    res_cfg.log_queries = cfg.log_queries;
 
     // ── Rate limiter ─────────────────────────────────────────────────────────
     let rate_limiter = cfg.rate_limit.as_ref().map(|rl| {
