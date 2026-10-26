@@ -134,18 +134,24 @@ pub fn run(state: Arc<State>) {
         });
     }
 
-    // SIGHUP reload watcher: polls the flag set by the signal handler
+    // SIGHUP reload watcher: polls the flag set by the signal handler. Zones are
+    // also reloaded (and so re-signed) once a day, well inside the 30-day validity.
     {
         let state = Arc::clone(&state);
-        spawn_supervised("reload-watcher", move || loop {
-            thread::sleep(Duration::from_secs(1));
-            if signals::should_reload() {
-                eprintln!("[signals] SIGHUP received, reloading zones");
-                let mut mgr = state.zone_manager.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-                mgr.reload_all();
-                let reloaded: Vec<Arc<Zone>> = mgr.get_zones();
-                if !reloaded.is_empty() {
-                    *state.zones.write().unwrap_or_else(std::sync::PoisonError::into_inner) = reloaded;
+        spawn_supervised("reload-watcher", move || {
+            let mut last_signed = Instant::now();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let resign_due = last_signed.elapsed() >= RESIGN_INTERVAL;
+                if signals::should_reload() || resign_due {
+                    last_signed = Instant::now();
+                    eprintln!("[zone-manager] {}, reloading zones", if resign_due { "re-signing" } else { "SIGHUP received" });
+                    let mut mgr = state.zone_manager.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    mgr.reload_all();
+                    let reloaded: Vec<Arc<Zone>> = mgr.get_zones();
+                    if !reloaded.is_empty() {
+                        *state.zones.write().unwrap_or_else(std::sync::PoisonError::into_inner) = reloaded;
+                    }
                 }
             }
         });
@@ -423,12 +429,16 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr, recursion: Recursio
 
         // Name exists but type doesn't → NODATA
         if zone.name_exists(&current_name) {
-            // RFC 4035 §3.1.3.1: the NSEC at the name proves the type is absent
-            if pkt.dnssec_ok {
-                if let Some(next) = zone.nsec_next(&current_name) {
-                    if let Some(nsec) = zone.nsec_record(&current_name, &next) {
-                        resp.authority.push(nsec);
-                    }
+            // RFC 4035 §3.1.3.1: the NSEC at the name proves the type is absent.
+            // An empty non-terminal has no NSEC of its own; the covering one proves it.
+            if pkt.dnssec_ok && zone.is_signed() {
+                let owner = if zone.lookup(&current_name, &RType::NSEC).is_some() {
+                    Some(current_name.as_str())
+                } else {
+                    zone.nsec_covering_owner(&current_name)
+                };
+                if let Some(owner) = owner {
+                    push_signed_nsec(&mut resp.authority, zone, owner);
                 }
             }
             state.metrics.record_success();
@@ -438,20 +448,33 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr, recursion: Recursio
 
         // NXDOMAIN
         resp.set_rcode(RCODE_NXDOMAIN);
-        // RFC 4035 §3.1.3 / RFC 5155 §7.2.2: include NSEC or NSEC3 proving
-        // non-existence when the DO bit is set. Prefer NSEC3 if the zone is
-        // configured for opt-out denial.
+        // RFC 4035 §3.1.3.2: with the DO bit set, prove both that the name does not
+        // exist and that no wildcard at its closest encloser could have matched it.
+        // The NSEC3 branch is only used when the zone file carries NSEC3 records.
         if pkt.dnssec_ok {
             if let Some(nsec3) = zone.nsec3_covering(&current_name) {
                 resp.authority.push(nsec3);
-            } else if let Some((prev, next)) = zone.nsec_covering(&current_name) {
-                if let Some(nsec) = zone.nsec_record(&prev, &next) {
-                    resp.authority.push(nsec);
+            } else if zone.is_signed() {
+                let wildcard = format!("*.{}", zone.closest_encloser(&current_name));
+                let name_owner = zone.nsec_covering_owner(&current_name).map(str::to_string);
+                let wildcard_owner = zone.nsec_covering_owner(&wildcard).map(str::to_string);
+                if let Some(owner) = &name_owner {
+                    push_signed_nsec(&mut resp.authority, zone, owner);
+                }
+                if let Some(owner) = wildcard_owner.filter(|owner| Some(owner) != name_owner.as_ref()) {
+                    push_signed_nsec(&mut resp.authority, zone, &owner);
                 }
             }
         }
         state.metrics.record_nxdomain();
         state.metrics.record_query_time(start.elapsed().as_nanos() as u64);
+        return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
+    }
+
+    // Recursion and the cache are only for allowed client networks; anyone else
+    // gets authoritative answers only (no open resolver, no cache snooping).
+    if !state.config.allow_recursion.iter().any(|network| network.contains(peer_ip)) {
+        resp.set_rcode(RCODE_REFUSED);
         return Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)));
     }
 
@@ -589,11 +612,22 @@ fn handle_query(data: &[u8], state: &State, peer_ip: IpAddr, recursion: Recursio
     Answer::Ready(Some(serialize(&resp, resp.edns_udp_size > 0)))
 }
 
+/// How often zones are reloaded and re-signed. Signatures last 30 days.
+const RESIGN_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
 /// Queued recursive UDP lookups allowed per recursion worker before new ones are dropped.
 const RECURSION_QUEUE_PER_WORKER: usize = 16;
 
 /// Longest CNAME chain followed inside an authoritative zone before giving up.
 const MAX_CNAME_CHAIN: usize = 8;
+
+/// The stored NSEC at `owner` together with its RRSIG.
+fn push_signed_nsec(section: &mut Vec<Record>, zone: &Zone, owner: &str) {
+    if let Some(nsec) = zone.lookup(owner, &RType::NSEC) {
+        section.extend(nsec.iter().cloned());
+        section.extend(covering_rrsigs(zone, owner, &RType::NSEC));
+    }
+}
 
 /// RRSIGs stored at `name` that cover `covered_type`.
 fn covering_rrsigs(zone: &Zone, name: &str, covered_type: &RType) -> Vec<Record> {

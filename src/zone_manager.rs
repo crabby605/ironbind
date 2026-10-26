@@ -200,6 +200,12 @@ impl ZoneManager {
             None => None,
         };
 
+        // Negative TTL per RFC 9077: the smaller of the SOA TTL and its MINIMUM field
+        let nsec_ttl = zone.soa().and_then(|soa| soa.first())
+            .map(|soa| soa.ttl.min(crate::cache::soa_minimum_ttl(&soa.rdata)))
+            .unwrap_or(3600);
+        zone.build_nsec_chain(nsec_ttl);
+
         let signer = ZoneSigner::new(zsk, ksk);
         let rrsets: Vec<Vec<Record>> = zone.iter_rrsets().cloned().collect();
 
@@ -298,6 +304,50 @@ mod tests {
     fn test_zone_manager_create() {
         let manager = ZoneManager::new();
         assert_eq!(manager.get_zones().len(), 0);
+    }
+
+    #[test]
+    fn test_signed_zone_has_valid_canonical_nsec_chain() {
+        use rsa::pkcs8::EncodePrivateKey;
+        use crate::dnssec::{Validator, ValidationResult};
+
+        // RFC 4034 §6.1 example order, minus the escaped labels
+        let expected = ["example", "a.example", "yljkjljk.a.example", "z.a.example", "zabc.a.example", "z.example", "*.z.example"];
+        let mut shuffled = expected.to_vec();
+        shuffled.reverse();
+        shuffled.sort_by(|a, b| crate::zone::canonical_order(a, b));
+        assert_eq!(shuffled, expected);
+
+        let directory = std::env::temp_dir().join(format!("ironbind-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        std::fs::write(directory.join("Kexample.com+008+zsk.private"), pem.as_bytes()).unwrap();
+        let zone_path = directory.join("example.com.zone");
+        std::fs::write(&zone_path, "$ORIGIN example.com.\n$TTL 3600\n\
+            @ IN SOA ns1 admin 1 3600 900 604800 300\n\
+            @ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.10\n").unwrap();
+
+        let mut zone = Zone::new("example.com");
+        zone.load_file(zone_path.to_str().unwrap()).unwrap();
+        ZoneManager::sign_zone(&mut zone, directory.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert!(zone.is_signed());
+        // "mail" sorts between "example.com" and "ns1"; "*.example.com" right after the apex
+        assert_eq!(zone.nsec_covering_owner("mail.example.com"), Some("example.com"));
+        assert_eq!(zone.nsec_covering_owner("*.example.com"), Some("example.com"));
+        assert_eq!(zone.nsec_covering_owner("zzz.example.com"), Some("www.example.com"));
+        assert_eq!(zone.closest_encloser("a.b.example.com"), "example.com");
+
+        let dnskeys = zone.lookup("example.com", &RType::DNSKEY).unwrap().clone();
+        for owner in ["example.com", "ns1.example.com", "www.example.com"] {
+            let nsec = zone.lookup(owner, &RType::NSEC).unwrap().clone();
+            let rrsigs: Vec<Record> = zone.lookup(owner, &RType::RRSIG).unwrap().iter()
+                .filter(|r| crate::proto::parse_rrsig(&r.rdata).unwrap().type_covered == u16::from(&RType::NSEC))
+                .cloned().collect();
+            assert!(matches!(Validator::validate_rrset(&nsec, &rrsigs, &dnskeys), ValidationResult::Secure), "{}", owner);
+        }
     }
 
     #[test]

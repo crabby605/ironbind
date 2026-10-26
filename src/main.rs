@@ -36,8 +36,10 @@ fn main() {
                 c
             }
             Err(e) => {
-                eprintln!("[config] failed to load {}: {} — using defaults", path, e);
-                ServerConfig::default()
+                // Refuse to start: falling back to defaults would silently drop the
+                // TSIG, rate limit and allow_recursion settings the operator asked for
+                eprintln!("[config] failed to load {}: {}", path, e);
+                std::process::exit(1);
             }
         }
     } else {

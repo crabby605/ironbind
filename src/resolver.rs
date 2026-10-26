@@ -21,7 +21,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use crate::proto::{Packet, Parser, Question, Record, RType, serialize, CLASS_IN};
 
@@ -43,6 +43,9 @@ const ROOT_SERVERS: &[(&str, &str)] = &[
 
 const TIMEOUT_MS:   u64 = 2000;
 const MAX_REFERRALS: usize = 20;
+/// Nested lookups for glueless NS names. Without a limit, nameservers that point
+/// at each other recurse until the stack overflows, which no panic handler can catch.
+const MAX_NS_LOOKUP_DEPTH: usize = 4;
 const DNS_PORT: u16 = 53;
 
 #[derive(Debug, Clone)]
@@ -142,14 +145,21 @@ impl Resolver {
         }
 
         // 2. Iterative resolution from root
-        self.iterative_resolve(name, qtype)
+        self.iterative_resolve(name, qtype, 0)
     }
 
-    fn iterative_resolve(&self, name: &str, qtype: &RType) -> ResolveResult {
+    fn iterative_resolve(&self, name: &str, qtype: &RType, depth: usize) -> ResolveResult {
+        if depth > MAX_NS_LOOKUP_DEPTH {
+            return ResolveResult::ServFail(format!("NS lookup depth exceeded for {}", name));
+        }
+
         // Start from a random root server
         let mut nameservers: Vec<IpAddr> = ROOT_SERVERS.iter()
             .filter_map(|(_, ip)| ip.parse().ok())
             .collect();
+        // The zone the current nameservers are authoritative for. Anything they
+        // return outside it is out of bailiwick and ignored (cache poisoning defence).
+        let mut current_zone = String::from(".");
 
         let mut referral_count = 0;
         let mut visited: HashSet<String> = HashSet::new();
@@ -192,6 +202,11 @@ impl Resolver {
                 ),
             };
 
+            let mut pkt = pkt;
+            pkt.answers.retain(|r| in_bailiwick(&r.name, &current_zone));
+            pkt.authority.retain(|r| in_bailiwick(&r.name, &current_zone));
+            pkt.additional.retain(|r| r.rtype == RType::OPT || in_bailiwick(&r.name, &current_zone));
+
             // NXDOMAIN
             if pkt.rcode() == crate::proto::RCODE_NXDOMAIN {
                 return ResolveResult::NxDomain(pkt);
@@ -214,6 +229,7 @@ impl Resolver {
                         nameservers = ROOT_SERVERS.iter()
                             .filter_map(|(_, ip)| ip.parse().ok())
                             .collect();
+                        current_zone = String::from(".");
                         referral_count += 1;
                         continue;
                     }
@@ -223,8 +239,19 @@ impl Resolver {
 
             // Referral — authority section has NS records
             if !pkt.authority.is_empty() {
+                // A referral must delegate to a zone below the one we asked about,
+                // and that zone must contain the name being resolved.
+                let delegation = pkt.authority.iter()
+                    .find(|r| r.rtype == RType::NS)
+                    .map(|r| r.name.to_ascii_lowercase());
+                let Some(delegated_zone) = delegation.filter(|zone| {
+                    zone != &current_zone && in_bailiwick(&current_name, zone)
+                }) else {
+                    return ResolveResult::ServFail(format!("bogus referral for {}", current_name));
+                };
+
                 let ns_names: Vec<String> = pkt.authority.iter()
-                    .filter(|r| r.rtype == RType::NS)
+                    .filter(|r| r.rtype == RType::NS && r.name.eq_ignore_ascii_case(&delegated_zone))
                     .map(|r| parse_name_from_rdata(&r.rdata))
                     .filter(|n| !n.is_empty())
                     .collect();
@@ -233,7 +260,7 @@ impl Resolver {
                     return ResolveResult::ServFail("empty referral".to_string());
                 }
 
-                // Check glue records in additional section
+                // Check glue records in additional section (already limited to the current zone)
                 let mut next_ns: Vec<IpAddr> = Vec::new();
                 for ns in &ns_names {
                     for add in &pkt.additional {
@@ -255,7 +282,7 @@ impl Resolver {
                 // No glue — resolve NS names directly
                 if next_ns.is_empty() {
                     for ns in &ns_names {
-                        match self.iterative_resolve(ns, &RType::A) {
+                        match self.iterative_resolve(ns, &RType::A, depth + 1) {
                             ResolveResult::Answer(p) => {
                                 for r in &p.answers {
                                     if r.rtype == RType::A && r.rdata.len() == 4 {
@@ -281,6 +308,7 @@ impl Resolver {
 
                 if self.config.log_queries { eprintln!("[iter] referral for {} → {:?}", current_name, &ns_names[..1]); }
                 nameservers = next_ns;
+                current_zone = delegated_zone;
                 referral_count += 1;
                 continue;
             }
@@ -293,11 +321,8 @@ impl Resolver {
 
 /// Build a recursive query with EDNS0 + DO bit set, used for DNSSEC fetches.
 fn build_query_dnssec(name: &str, qtype: &RType) -> Vec<u8> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let id = (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() & 0xFFFF) as u16;
+    // Unpredictable ID: together with the random source port this is what a spoofer has to guess
+    let id: u16 = rand::random();
     let pkt = Packet {
         id,
         flags: 0x0100, // RD
@@ -310,11 +335,8 @@ fn build_query_dnssec(name: &str, qtype: &RType) -> Vec<u8> {
 }
 
 fn build_query(name: &str, qtype: &RType, recurse: bool) -> Vec<u8> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let id = (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() & 0xFFFF) as u16;
+    // Unpredictable ID: together with the random source port this is what a spoofer has to guess
+    let id: u16 = rand::random();
 
     let flags: u16 = if recurse { 0x0100 } else { 0x0000 }; // RD bit
 
@@ -339,22 +361,35 @@ fn build_query(name: &str, qtype: &RType, recurse: bool) -> Vec<u8> {
 }
 
 fn udp_exchange(query: &[u8], addr: &SocketAddr, timeout_ms: u64) -> std::io::Result<Packet> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    sock.send_to(query, addr)?;
+    // A fresh socket per query gets a random ephemeral source port from the OS.
+    // Connecting it makes the kernel drop datagrams from any other address.
+    let local = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = UdpSocket::bind(local)?;
+    sock.connect(addr)?;
+    sock.send(query)?;
 
+    let expected = Parser::new(query).parse()?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut buf = vec![0u8; 4096];
-    let (len, _) = sock.recv_from(&mut buf)?;
-    buf.truncate(len);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no matching reply"));
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        let len = sock.recv(&mut buf)?;
 
-    let pkt = Parser::new(&buf).parse()?;
+        // Ignore anything that isn't the reply to this exact query: a spoofed
+        // packet has to match the ID and question as well as the port.
+        let Ok(pkt) = Parser::new(&buf[..len]).parse() else { continue };
+        if !answers_query(&expected, &pkt) { continue; }
 
-    // TC bit set — retry over TCP
-    if pkt.truncated() {
-        return tcp_exchange(query, addr, timeout_ms);
+        // TC bit set — retry over TCP
+        if pkt.truncated() {
+            return tcp_exchange(query, addr, timeout_ms);
+        }
+        return Ok(pkt);
     }
-
-    Ok(pkt)
 }
 
 fn tcp_exchange(query: &[u8], addr: &SocketAddr, timeout_ms: u64) -> std::io::Result<Packet> {
@@ -375,10 +410,65 @@ fn tcp_exchange(query: &[u8], addr: &SocketAddr, timeout_ms: u64) -> std::io::Re
     let mut buf = vec![0u8; rlen];
     stream.read_exact(&mut buf)?;
 
-    Parser::new(&buf).parse()
+    let pkt = Parser::new(&buf).parse()?;
+    let expected = Parser::new(query).parse()?;
+    if !answers_query(&expected, &pkt) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "reply does not match query"));
+    }
+    Ok(pkt)
+}
+
+/// True when `reply` is a response with the same ID and question as `query`.
+fn answers_query(query: &Packet, reply: &Packet) -> bool {
+    let (Some(asked), Some(answered)) = (query.questions.first(), reply.questions.first()) else { return false };
+    reply.is_response()
+        && reply.id == query.id
+        && answered.name.eq_ignore_ascii_case(&asked.name)
+        && answered.qtype == asked.qtype
+        && answered.qclass == asked.qclass
+}
+
+/// True when `name` is `zone` or below it ("." contains everything).
+fn in_bailiwick(name: &str, zone: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let zone = zone.trim_end_matches('.').to_ascii_lowercase();
+    zone.is_empty() || name == zone || name.ends_with(&format!(".{}", zone))
 }
 
 /// Decode a DNS-wire-encoded name from rdata (no compression — NS/CNAME rdata)
 fn parse_name_from_rdata(rdata: &[u8]) -> String {
     Parser::new(rdata).name().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet(id: u16, flags: u16, name: &str, qtype: RType) -> Packet {
+        Packet {
+            id, flags,
+            questions: vec![Question { name: name.to_string(), qtype, qclass: CLASS_IN }],
+            answers: vec![], authority: vec![], additional: vec![],
+            edns_udp_size: 0, dnssec_ok: false,
+        }
+    }
+
+    #[test]
+    fn test_reply_must_match_query() {
+        let query = packet(4242, 0x0100, "www.example.com", RType::A);
+        assert!(answers_query(&query, &packet(4242, 0x8180, "WWW.example.com", RType::A)));
+        assert!(!answers_query(&query, &packet(4243, 0x8180, "www.example.com", RType::A)), "wrong ID");
+        assert!(!answers_query(&query, &packet(4242, 0x8180, "evil.example.com", RType::A)), "wrong name");
+        assert!(!answers_query(&query, &packet(4242, 0x8180, "www.example.com", RType::AAAA)), "wrong type");
+        assert!(!answers_query(&query, &packet(4242, 0x0100, "www.example.com", RType::A)), "not a response");
+    }
+
+    #[test]
+    fn test_bailiwick() {
+        assert!(in_bailiwick("www.example.com", "example.com"));
+        assert!(in_bailiwick("example.com", "example.com"));
+        assert!(in_bailiwick("anything.org", "."));
+        assert!(!in_bailiwick("www.attacker.com", "example.com"));
+        assert!(!in_bailiwick("badexample.com", "example.com"));
+    }
 }

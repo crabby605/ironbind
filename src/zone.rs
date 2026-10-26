@@ -1,5 +1,6 @@
 /// Authoritative zone — RFC 1035 zone file parser + in-memory store
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap},
     fs,
     net::{Ipv4Addr, Ipv6Addr},
@@ -13,6 +14,8 @@ pub struct Zone {
     rrsets: HashMap<(String, u16), Vec<Record>>,
     /// All known names (for NSEC)
     names:  BTreeMap<String, ()>,
+    /// NSEC chain owners in canonical order; empty for an unsigned zone
+    nsec_owners: Vec<String>,
 }
 
 impl Zone {
@@ -21,6 +24,7 @@ impl Zone {
             origin: origin.trim_end_matches('.').to_ascii_lowercase(),
             rrsets: HashMap::new(),
             names:  BTreeMap::new(),
+            nsec_owners: Vec::new(),
         }
     }
 
@@ -60,60 +64,71 @@ impl Zone {
         self.rrsets.values()
     }
 
-    /// All records of a given type for NSEC chain building
-    pub fn all_names_sorted(&self) -> Vec<String> {
-        self.names.keys().cloned().collect()
-    }
-
-    /// NSEC next name for a given name (RFC 4034 §4)
-    pub fn nsec_next(&self, name: &str) -> Option<String> {
-        let lower = name.to_ascii_lowercase();
-        let mut found = false;
-        for k in self.names.keys() {
-            if found { return Some(k.clone()); }
-            if k == &lower { found = true; }
+    /// Build the NSEC chain (RFC 4034 §4) over every owner name, in canonical
+    /// order, so it can be signed with the rest of the zone. Each NSEC lists the
+    /// types at its owner plus the RRSIG and NSEC records signing adds.
+    pub fn build_nsec_chain(&mut self, ttl: u32) {
+        let mut owners: Vec<String> = self.names.keys().cloned().collect();
+        owners.sort_by(|a, b| canonical_order(a, b));
+        for (index, owner) in owners.iter().enumerate() {
+            let next = &owners[(index + 1) % owners.len()];
+            let mut types: Vec<u16> = self.rrsets.keys()
+                .filter(|(name, _)| name == owner)
+                .map(|(_, rtype)| *rtype)
+                .collect();
+            types.extend([u16::from(&RType::RRSIG), u16::from(&RType::NSEC)]);
+            let mut rdata = Builder::new();
+            rdata.name(next);
+            rdata.raw(&encode_nsec_bitmap(&types));
+            self.add(Record {
+                name:  owner.clone(),
+                rtype: RType::NSEC,
+                class: crate::proto::CLASS_IN,
+                ttl,
+                rdata: rdata.finish(),
+            });
         }
-        // Wrap around to first name (last NSEC points to zone apex)
-        self.names.keys().next().cloned()
+        self.nsec_owners = owners;
     }
 
-    /// Return the lexicographic predecessor / successor pair (RFC 4034 §6.1)
-    /// surrounding `qname`, used to build NSEC denial-of-existence records.
-    pub fn nsec_covering(&self, qname: &str) -> Option<(String, String)> {
-        let lower = qname.to_ascii_lowercase();
-        let names: Vec<&String> = self.names.keys().collect();
-        if names.is_empty() { return None; }
-        let mut prev = names.last().copied()?.clone();
-        for n in &names {
-            if n.as_str() > lower.as_str() {
-                return Some((prev, (*n).clone()));
+    /// True once the zone carries a signed NSEC chain.
+    pub fn is_signed(&self) -> bool {
+        !self.nsec_owners.is_empty()
+    }
+
+    /// Owner of the NSEC that proves `name` does not exist: the last owner that
+    /// sorts before it canonically, wrapping to the final owner (RFC 4034 §6.1).
+    pub fn nsec_covering_owner(&self, name: &str) -> Option<&str> {
+        let position = self.nsec_owners.partition_point(|owner| canonical_order(owner, name) == Ordering::Less);
+        let index = if position == 0 { self.nsec_owners.len().checked_sub(1)? } else { position - 1 };
+        self.nsec_owners.get(index).map(String::as_str)
+    }
+
+    /// Longest ancestor of `name` that exists in the zone (RFC 4592 §3.3.1).
+    pub fn closest_encloser(&self, name: &str) -> String {
+        let mut candidate = name.to_ascii_lowercase();
+        while candidate != self.origin {
+            match candidate.split_once('.') {
+                Some((_, parent)) => candidate = parent.to_string(),
+                None => return self.origin.clone(),
             }
-            prev = (*n).clone();
+            if self.name_exists(&candidate) { return candidate; }
         }
-        // qname is after all names → wrap to first.
-        Some((prev, names.first().copied()?.clone()))
+        candidate
     }
+}
 
-    /// Build the NSEC bitmap of types that exist at `owner` (RFC 4034 §4.1.2).
-    pub fn nsec_record(&self, owner: &str, next: &str) -> Option<Record> {
-        use crate::proto::Builder;
-        let lower = owner.to_ascii_lowercase();
-        let types: Vec<u16> = self.rrsets.iter()
-            .filter(|((n, _), _)| n == &lower)
-            .map(|((_, t), _)| *t)
-            .collect();
-        if types.is_empty() && owner != &self.origin { return None; }
-        let mut b = Builder::new();
-        b.name(next);
-        b.raw(&encode_nsec_bitmap(&types));
-        Some(Record {
-            name:  owner.to_string(),
-            rtype: RType::NSEC,
-            class: crate::proto::CLASS_IN,
-            ttl:   3600,
-            rdata: b.finish(),
-        })
-    }
+/// DNSSEC canonical name order (RFC 4034 §6.1): compare labels from the root
+/// down, each as lowercase bytes, with a missing label sorting first.
+pub fn canonical_order(a: &str, b: &str) -> Ordering {
+    let labels = |name: &str| -> Vec<Vec<u8>> {
+        name.trim_end_matches('.')
+            .rsplit('.')
+            .filter(|label| !label.is_empty())
+            .map(|label| label.to_ascii_lowercase().into_bytes())
+            .collect()
+    };
+    labels(a).cmp(&labels(b))
 }
 
 /// RFC 4034 §4.1.2 type-bitmap encoding: windowed bitmap of present RR types.

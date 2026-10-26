@@ -144,7 +144,9 @@ impl ZoneSigner {
         Self {
             zsk,
             ksk,
-            inception: now,
+            // Start an hour back so validators with a slightly slow clock accept it
+            inception: now.saturating_sub(3600),
+            // The server re-signs daily, long before this runs out
             expiration: now + (30 * 24 * 3600), // 30 days
         }
     }

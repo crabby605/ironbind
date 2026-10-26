@@ -1,7 +1,7 @@
 /// Hand-rolled TOML parser (zero deps) — supports:
 ///   strings, integers, booleans, arrays of strings
 ///   [sections] and inline key = value
-use std::{collections::HashMap, fs, str::FromStr};
+use std::{collections::HashMap, fs, net::IpAddr};
 
 #[derive(Debug, Clone)]
 pub enum TomlVal {
@@ -138,6 +138,9 @@ pub struct ServerConfig {
     /// When true, validation walks the full chain from IANA root anchors down
     /// to the answer's zone instead of trusting any DNSKEY the upstream sent.
     pub dnssec_strict:   bool,
+    /// Client networks allowed to use recursion and the cache. Everyone may
+    /// query the authoritative zones. A public resolver sets 0.0.0.0/0 and ::/0.
+    pub allow_recursion: Vec<Network>,
     pub cache_max:       usize,
     pub neg_cache_ttl:   u32,
     pub zone_files:      Vec<String>,
@@ -243,6 +246,51 @@ fn read_keychain(_service: &str) -> Result<String, String> {
     Err("Keychain lookup not supported on this platform; use secret_file instead".to_string())
 }
 
+/// Loopback, private, link-local and carrier-grade NAT ranges: recursion stays
+/// off the public internet unless allow_recursion says otherwise.
+const DEFAULT_ALLOW_RECURSION: &[&str] = &[
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10",
+];
+
+/// An address range written as `address/prefix`, or a bare address.
+#[derive(Debug, Clone)]
+pub struct Network {
+    address: IpAddr,
+    prefix:  u8,
+}
+
+impl Network {
+    pub fn parse(text: &str) -> Option<Self> {
+        let (address_text, prefix_text) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (text, None),
+        };
+        let address: IpAddr = address_text.trim().parse().ok()?;
+        let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix_text {
+            Some(p) => p.trim().parse::<u8>().ok().filter(|p| *p <= max_prefix)?,
+            None => max_prefix,
+        };
+        Some(Self { address, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // IPv4 clients on an IPv6 socket arrive as ::ffff:a.b.c.d
+        match (self.address, ip.to_canonical()) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - self.prefix as u32).unwrap_or(0);
+                u32::from(network) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - self.prefix as u32).unwrap_or(0);
+                u128::from(network) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
     /// Per source IP (ignored when per_ip is false)
@@ -262,6 +310,7 @@ impl Default for ServerConfig {
             use_forwarders:  true,
             dnssec_validate: true,
             dnssec_strict:   false,
+            allow_recursion: DEFAULT_ALLOW_RECURSION.iter().filter_map(|n| Network::parse(n)).collect(),
             cache_max:       100_000,
             neg_cache_ttl:   300,
             zone_files:      vec![],
@@ -290,6 +339,18 @@ impl ServerConfig {
         if let Some(v) = t.bool(Some("server"), "use_forwarders") { c.use_forwarders = v; }
         if let Some(v) = t.bool(Some("server"), "dnssec_validate") { c.dnssec_validate = v; }
         if let Some(v) = t.bool(Some("server"), "dnssec_strict")   { c.dnssec_strict = v; }
+        if t.get(Some("server"), "allow_recursion").is_some() {
+            c.allow_recursion = Vec::new();
+            for entry in t.array(Some("server"), "allow_recursion") {
+                match Network::parse(&entry) {
+                    Some(network) => c.allow_recursion.push(network),
+                    None => return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("allow_recursion: '{}' is not an address or CIDR network", entry),
+                    )),
+                }
+            }
+        }
         if let Some(v) = t.int(Some("cache"),  "max_entries") { c.cache_max = v as usize; }
         if let Some(v) = t.int(Some("cache"),  "neg_ttl")     { c.neg_cache_ttl = v as u32; }
         if let Some(v) = t.str(Some("server"), "log_level")   { c.log_level = v.to_string(); }
@@ -359,5 +420,23 @@ impl ServerConfig {
         } else {
             format!("{}:{}", self.bind, self.port)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_network_contains() {
+        let private = Network::parse("10.0.0.0/8").unwrap();
+        assert!(private.contains("10.20.30.40".parse().unwrap()));
+        assert!(!private.contains("11.0.0.1".parse().unwrap()));
+        assert!(private.contains("::ffff:10.1.2.3".parse().unwrap()), "IPv4-mapped client");
+        assert!(Network::parse("0.0.0.0/0").unwrap().contains("203.0.113.9".parse().unwrap()));
+        assert!(Network::parse("::/0").unwrap().contains("2001:db8::1".parse().unwrap()));
+        assert!(Network::parse("192.0.2.7").unwrap().contains("192.0.2.7".parse().unwrap()));
+        assert!(Network::parse("10.0.0.0/33").is_none());
+        assert!(Network::parse("not-an-ip").is_none());
     }
 }
