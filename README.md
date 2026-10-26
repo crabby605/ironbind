@@ -2,16 +2,18 @@
 
 A BIND-shaped authoritative + recursive DNS server, written from scratch in Rust.
 
-![ironbind serving a zone file, NXDOMAIN with NSEC, cached recursion compared with Quad9, Google and Cloudflare, DNS-over-HTTPS, and Prometheus metrics](demo.gif)
+![ironbind serving a signed zone file and following a CNAME, a signed NSEC proof validated by Unbound, cached recursion compared with Quad9, Google and Cloudflare, DNS-over-HTTPS, and Prometheus metrics including load-shedding counters](demo.gif)
 
 ## What it does
 
 - **Authoritative serving** for zones loaded from RFC 1035 zone files (A, AAAA, CNAME, MX, NS, SOA, TXT, PTR, SRV, NAPTR, DNSKEY, DS, RRSIG, NSEC, NSEC3, NSEC3PARAM)
 - **Recursive resolution** via forwarders (`/etc/resolv.conf`) with iterative fallback from the root servers; CNAME chasing; TCP failover on truncation
+- **Spoofing-resistant upstream queries** — random IDs and source ports, connected sockets, replies must match the ID and question, and bailiwick checks on referrals, glue and answers
+- **Recursion access control** — `allow_recursion` limits recursion and the cache to listed networks (private ranges by default); everyone can query the authoritative zones
 - **DNSSEC validation** with real crypto — RSA-SHA256/512, ECDSA P-256/P-384, Ed25519 (uses the `rsa`, `p256`, `p384`, `ed25519-dalek` crates)
 - **Full chain of trust** anchored at the pinned IANA root KSKs (KSK-2017, KSK-2024) when `dnssec_strict = true`
-- **Denial of existence** — emits NSEC or NSEC3 (RFC 5155) on authoritative NXDOMAIN
-- **Zone signing** at load time: when `keys/K<zone>+008+zsk.private` exists the zone is signed with RSA-SHA256, DNSKEY records are published, and the KSK signs the DNSKEY RRset
+- **Zone signing** at load time and every 24 hours: when `keys/K<zone>+008+zsk.private` exists the zone is signed with RSA-SHA256, DNSKEY records are published, and the KSK signs the DNSKEY RRset
+- **Authenticated denial of existence** — a signed NSEC chain in canonical order; NXDOMAIN carries the proofs for the name and the wildcard, NODATA the NSEC at the name. Validated end to end with Unbound
 - **AXFR + IXFR** over TCP (RFC 5936, RFC 1995) with on-disk delta history for true incremental transfers
 - **TSIG (HMAC-SHA256)** signing and verification on transfers and (optionally) every query (RFC 8945)
 - **DNS-over-TLS** (RFC 7858) and **DNS-over-HTTPS** (RFC 8484) via `rustls`
@@ -83,6 +85,8 @@ udp_receivers    = 2             # threads reading the UDP socket; more contend 
 use_forwarders   = true          # try /etc/resolv.conf before iterative
 dnssec_validate  = true          # validate RRSIGs on recursive answers
 dnssec_strict    = false         # if true, walk full chain from IANA anchors
+allow_recursion  = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7"]
+                                 # who may recurse / use the cache (default: loopback, private, CGNAT, link-local)
 tcp_timeout_ms   = 5000          # also applies to DoT/DoH connections
 log_queries      = false         # log every query to stderr (megabytes per second under load)
 
@@ -122,7 +126,7 @@ cert = "tls/cert.pem"
 key  = "tls/key.pem"
 ```
 
-Omit any section to disable that feature. With no `[zones]`, ironbind serves a built-in `example.local` zone for sanity-checking.
+Omit any section to disable that feature. An invalid value stops the server at startup rather than falling back to defaults. With no `[zones]`, ironbind serves a built-in `example.local` zone for sanity-checking.
 
 ## Usage
 
@@ -138,9 +142,26 @@ Run `./setup.sh` (or drop your own RSA keys at `keys/K<zone>+008+zsk.private` an
 dig @127.0.0.1 -p 5000 example.com DNSKEY | dnssec-dsfromkey -f - example.com
 ```
 
+Signatures are valid for 30 days and the zone is re-signed every 24 hours. Answers, NXDOMAIN and NODATA proofs all validate as secure in Unbound anchored on the zone's KSK.
+
 ### Recursive resolution
 
 Set `use_forwarders = true` to delegate to whatever's in `/etc/resolv.conf`. Disable to force iterative resolution from the root.
+
+Recursion is only offered to `allow_recursion` networks; other clients get REFUSED for anything outside the authoritative zones. To run a public resolver like 1.1.1.1 or Quad9, open it up and keep the rate limits on, since open resolvers get used for amplification:
+
+```toml
+[server]
+allow_recursion = ["0.0.0.0/0", "::/0"]
+
+[ratelimit]
+queries_per_second        = 100
+global_queries_per_second = 200000
+```
+
+![ironbind against Quad9, Google and Cloudflare: warm-cache and cold-name query times from bench.sh](comparison.gif)
+
+`./bench.sh NAME [N]` reproduces the comparison: warm cache on localhost answers in under a millisecond; cold names depend on the upstream path.
 
 ### DNS-over-TLS
 
@@ -227,7 +248,10 @@ A panicking query is contained to that query, and every listener restarts itself
 ## What's not in here
 
 - IXFR with arbitrarily deep history (kept bounded; falls back to AXFR on gap)
-- NSEC3 closest-encloser / wildcard denial proofs
+- NSEC3 signing (signed zones use NSEC, so names can be enumerated by walking the chain)
+- Response rate limiting (RRL); per-IP and global caps only
+- Wildcard records (`*` owners load but aren't synthesized)
+- Automatic SOA serial bump on re-signing, so secondaries only pick up new signatures on the next serial change
 - Notify (RFC 1996) — secondaries must poll
 - DNSCrypt
 - Dynamic updates (RFC 2136)
